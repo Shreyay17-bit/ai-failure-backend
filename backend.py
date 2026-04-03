@@ -4,45 +4,49 @@ import uvicorn
 
 app = FastAPI()
 
+# This defines what the AI expects to receive from your Kivy app
 class Telemetry(BaseModel):
     device_type: str
     battery: float
     cpu_load: float
     memory: float
 
+# --- NEW: ROOT ROUTE ---
+# This fixes the {"detail":"Not Found"} error when you visit the main URL
+@app.get("/")
+async def home():
+    return {
+        "status": "AI System Online", 
+        "message": "Neural Monitor Backend is live on Render",
+        "version": "1.0.2"
+    }
+
+# --- PREDICTION ROUTE ---
 @app.post("/predict")
 async def predict(data: Telemetry):
-
-    ram_weight = 0.4 if data.device_type != 'win' else 0.2
+    # AI Logic: Calculates failure risk based on real-time hardware stress
+    # Formula: (CPU 60%) + (Memory 40%)
+    risk_score = (data.cpu_load * 0.6) + (data.memory * 0.4)
     
-    risk = (data.cpu_load * 0.5) + (data.memory * ram_weight)
-
-    if data.battery < 20:
-        risk += 25
-
-    risk = min(risk, 100)
-
-    # smarter insights
-    if risk > 80:
-        insight = "CRITICAL: System instability imminent!"
-    elif risk > 60:
-        insight = "Warning: Performance degrading."
-    elif data.cpu_load > 85:
-        insight = "High CPU usage detected."
+    # Determine the status level
+    if risk_score > 80:
+        analysis = "CRITICAL: High Failure Probability"
+    elif risk_score > 50:
+        analysis = "WARNING: System Stress Detected"
     else:
-        insight = "All systems operating normally."
+        analysis = "NOMINAL: System Healthy"
 
     return {
-        "risk": f"{risk:.1f}%",
-        "analysis": insight,
+        "risk": f"{min(risk_score, 99):.1f}%",
         "raw_metrics": {
-            "CPU": f"{data.cpu_load}%",
-            "RAM": f"{data.memory}%",
-            "BATT": f"{data.battery}%"
-        }
+            "CPU": f"{int(data.cpu_load)}%", 
+            "RAM": f"{int(data.memory)}%", 
+            "BATT": f"{int(data.battery)}%"
+        },
+        "analysis": analysis,
+        "device": data.device_type
     }
 
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # This part allows you to run it locally for testing
+    uvicorn.run(app, host="0.0.0.0", port=8000)
