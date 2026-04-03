@@ -1,3 +1,9 @@
+import os
+# Fix for Kivy startup and SSL certificates on Windows/Cloud
+os.environ['KIVY_NO_ARGS'] = '1'
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
 from kivy.app import App
 from kivy.lang import Builder
 from kivy.network.urlrequest import UrlRequest
@@ -88,7 +94,7 @@ BoxLayout:
 
     Label:
         id: analysis
-        text: "AI Status: Connecting to Render..."
+        text: "AI Status: Handshaking with Render..."
         italic: True
         color: hex("#AAAAAA")
         size_hint_y: None
@@ -97,10 +103,9 @@ BoxLayout:
 
 class FailurePredictor(App):
     def build(self):
-        # UPDATE: Pointing to your cloud backend
+        # POINTING TO YOUR LIVE RENDER BACKEND
         self.api_url = "https://ai-failure-backend.onrender.com/predict"
         self.ui = Builder.load_string(KV)
-        # Slower interval (3s) to respect free-tier Render limits
         Clock.schedule_interval(self.update_telemetry, 3.0)
         return self.ui
 
@@ -117,18 +122,19 @@ class FailurePredictor(App):
             "memory": float(mem)
         }
         
-        # Adding a timeout=5 to prevent the app from "hanging"
+        # Send data to Cloud AI
         UrlRequest(
             self.api_url,
             req_body=json.dumps(payload),
             req_headers={'Content-type': 'application/json'},
             on_success=self.on_api_success,
-            on_failure=lambda r, e: self.set_status("⚠️ Server waking up..."),
-            on_error=lambda r, e: self.set_status("⚠️ Check Internet"),
-            timeout=5
+            on_failure=lambda r, e: self.set_status("⚠️ Server Waking Up..."),
+            on_error=lambda r, e: self.set_status("⚠️ Connection Lag"),
+            timeout=10
         )
 
     def on_api_success(self, req, res):
+        # Extract risk and metrics from the JSON response
         risk_str = res.get('risk', '0%').replace('%', '')
         risk = float(risk_str)
         self.ui.ids.bar.value = risk
