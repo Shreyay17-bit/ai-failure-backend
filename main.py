@@ -8,7 +8,7 @@ from plyer import battery, accelerometer
 
 # IMPORTANT: Change 'localhost' to your PC's IP address (e.g., 192.168.1.5)
 # UPDATE THIS LINE
-SERVER_URL = "http://172.20.10.11:8000/predict"
+SERVER_URL = "https://ai-failure-backend.onrender.com"
 
 class PdMProbe(BoxLayout):
     def __init__(self, **kwargs):
