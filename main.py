@@ -1,153 +1,41 @@
-import os
-# Fix for Kivy startup and SSL certificates on Windows/Cloud
-os.environ['KIVY_NO_ARGS'] = '1'
-import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
-
 from kivy.app import App
-from kivy.lang import Builder
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.label import Label
+from kivy.uix.button import Button
 from kivy.network.urlrequest import UrlRequest
-from kivy.clock import Clock
-from kivy.utils import platform as kivy_platform
-import psutil
-import json
+import json, platform
+from plyer import battery, accelerometer
 
-KV = """
-#:import hex kivy.utils.get_color_from_hex
-#:import dp kivy.metrics.dp
+# IMPORTANT: Change 'localhost' to your PC's IP address (e.g., 192.168.1.5)
+# UPDATE THIS LINE
+SERVER_URL = "http://172.20.10.11:8000/predict"
 
-<CircularProgress@Widget>:
-    value: 0
-    canvas:
-        Color:
-            rgba: 0.2, 0.2, 0.2, 1
-        Line:
-            width: dp(8)
-            circle: (self.center_x, self.center_y, min(self.size)/2 - dp(10))
-        Color:
-            rgba: (0, 1, 0.8, 1) if self.value < 40 else (1, 0.6, 0, 1) if self.value < 75 else (1, 0.2, 0.2, 1)
-        Line:
-            width: dp(8)
-            circle: (self.center_x, self.center_y, min(self.size)/2 - dp(10), 0, self.value * 3.6)
-
-BoxLayout:
-    orientation: 'vertical'
-    padding: dp(20)
-    spacing: dp(15)
-    canvas.before:
-        Color:
-            rgba: 0.05, 0.05, 0.1, 1
-        Rectangle:
-            pos: self.pos
-            size: self.size
-
-    Label:
-        text: "NEURAL SYSTEM MONITOR"
-        font_size: '18sp'
-        color: hex("#00FFC8")
-        bold: True
-        size_hint_y: None
-        height: dp(50)
-
-    BoxLayout:
-        orientation: 'vertical'
-        size_hint_y: 0.6
-        CircularProgress:
-            id: bar
-            size_hint: None, None
-            size: dp(220), dp(220)
-            pos_hint: {"center_x": 0.5}
-        Label:
-            id: risk_val
-            text: "0%"
-            font_size: '55sp'
-            bold: True
-
-    GridLayout:
-        cols: 3
-        spacing: dp(10)
-        size_hint_y: 0.2
-        BoxLayout:
-            orientation: 'vertical'
-            Label:
-                text: "CPU"
-                color: hex("#888888")
-            Label:
-                id: cpu_text
-                text: "0%"
-        BoxLayout:
-            orientation: 'vertical'
-            Label:
-                text: "RAM"
-                color: hex("#888888")
-            Label:
-                id: ram_text
-                text: "0%"
-        BoxLayout:
-            orientation: 'vertical'
-            Label:
-                text: "BATT"
-                color: hex("#888888")
-            Label:
-                id: bat_text
-                text: "0%"
-
-    Label:
-        id: analysis
-        text: "AI Status: Handshaking with Render..."
-        italic: True
-        color: hex("#AAAAAA")
-        size_hint_y: None
-        height: dp(40)
-"""
-
-class FailurePredictor(App):
-    def build(self):
-        # POINTING TO YOUR LIVE RENDER BACKEND
-        self.api_url = "https://ai-failure-backend.onrender.com/predict"
-        self.ui = Builder.load_string(KV)
-        Clock.schedule_interval(self.update_telemetry, 3.0)
-        return self.ui
-
-    def update_telemetry(self, dt):
-        cpu = psutil.cpu_percent()
-        mem = psutil.virtual_memory().percent
-        batt = psutil.sensors_battery()
-        batt_p = batt.percent if batt else 100.0
+class PdMProbe(BoxLayout):
+    def __init__(self, **kwargs):
+        super().__init__(orientation='vertical', padding=20, spacing=10, **kwargs)
+        self.add_widget(Label(text="NEURAL PROBE AI", font_size='24sp', bold=True))
+        self.status = Label(text="System Ready", color=(0, 1, 0.8, 1))
+        self.add_widget(self.status)
         
-        payload = {
-            "device_type": str(kivy_platform),
-            "battery": float(batt_p),
-            "cpu_load": float(cpu),
-            "memory": float(mem)
-        }
-        
-        # Send data to Cloud AI
-        UrlRequest(
-            self.api_url,
-            req_body=json.dumps(payload),
-            req_headers={'Content-type': 'application/json'},
-            on_success=self.on_api_success,
-            on_failure=lambda r, e: self.set_status("⚠️ Server Waking Up..."),
-            on_error=lambda r, e: self.set_status("⚠️ Connection Lag"),
-            timeout=10
-        )
+        btn = Button(text="START SCAN", size_hint_y=None, height=100)
+        btn.bind(on_press=self.scan_and_send)
+        self.add_widget(btn)
 
-    def on_api_success(self, req, res):
-        # Extract risk and metrics from the JSON response
-        risk_str = res.get('risk', '0%').replace('%', '')
-        risk = float(risk_str)
-        self.ui.ids.bar.value = risk
-        self.ui.ids.risk_val.text = f"{int(risk)}%"
-        
-        metrics = res.get('raw_metrics', {})
-        self.ui.ids.cpu_text.text = metrics.get('CPU', '0%')
-        self.ui.ids.ram_text.text = metrics.get('RAM', '0%')
-        self.ui.ids.bat_text.text = metrics.get('BATT', '0%')
-        self.ui.ids.analysis.text = f"AI Insight: {res.get('analysis', 'Stable')}"
+    def scan_and_send(self, instance):
+        try:
+            accelerometer.enable()
+            v = sum(abs(x) for x in (accelerometer.acceleration or [0,0,0]))
+            b = battery.status.get('percentage', 100)
+        except: v, b = 0.2, 100 # PC Fallback
 
-    def set_status(self, msg):
-        self.ui.ids.analysis.text = msg
+        payload = {"device_type": platform.system(), "battery": b, "cpu_load": 55.0, "memory": 40.0, "vibration": v}
+        UrlRequest(SERVER_URL, req_body=json.dumps(payload), req_headers={'Content-Type': 'application/json'},
+                   on_success=self.on_ok, on_failure=self.on_fail)
 
-if __name__ == "__main__":
-    FailurePredictor().run()
+    def on_ok(self, req, res): self.status.text = f"AI Result: {res['analysis']}\nRisk: {res['risk']}"
+    def on_fail(self, req, err): self.status.text = "Connection Failed!"
+
+class PdMApp(App):
+    def build(self): return PdMProbe()
+
+if __name__ == "__main__": PdMApp().run()
