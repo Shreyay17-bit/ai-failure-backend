@@ -7,26 +7,30 @@ from sklearn.linear_model import LinearRegression
 
 app = FastAPI()
 
-# AI MODELS
+# ---------------- AI MODELS ----------------
 model = IsolationForest(contamination=0.05, random_state=42)
 trend_model = LinearRegression()
 
 baseline = np.random.normal(0.08, 0.02, (200, 1))
 model.fit(baseline)
 
+# ---------------- DATA ----------------
 history = []
+battery_history = []
+time_history = []
 
 last_data = {
     "score": 100,
     "vibration": 0,
-    "risk": "NOMINAL",
-    "analysis": "System Ready",
     "z_score": 0,
     "trend": "STABLE",
     "frequency": 0,
-    "fault": "NONE",
-    "battery": 0
+    "fault": "NORMAL",
+    "battery": -1,
+    "battery_drain": "N/A",
+    "risk": "NOMINAL"
 }
+
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -35,25 +39,25 @@ async def home():
 
 @app.post("/predict")
 async def predict(data: dict):
-    global history, last_data
+    global history, battery_history, time_history, last_data
 
     vib = float(data.get("vibration", 0))
-    battery = data.get("battery", 0)
+    battery = int(data.get("battery", -1))
 
     history.append(vib)
     if len(history) > 50:
         history.pop(0)
 
-    # HEALTH
+    # ---------- HEALTH ----------
     score_raw = model.decision_function([[vib]])[0]
     health = int(max(0, min(100, (score_raw + 0.5) * 100)))
 
-    # Z SCORE
+    # ---------- Z SCORE ----------
     mean = np.mean(history)
     std = np.std(history) if len(history) > 1 else 1
-    z = abs((vib - mean) / std) if std > 0 else 0
+    z = abs((vib - mean) / std)
 
-    # TREND
+    # ---------- TREND ----------
     trend = "STABLE"
     if len(history) >= 5:
         x = np.arange(len(history)).reshape(-1, 1)
@@ -65,16 +69,15 @@ async def predict(data: dict):
         elif slope < -0.002:
             trend = "DECREASING"
 
-    # FREQUENCY
+    # ---------- FREQUENCY ----------
     freq = 0
     if len(history) >= 10:
         fft = np.fft.fft(history)
         freqs = np.fft.fftfreq(len(history))
         freq = abs(freqs[np.argmax(np.abs(fft))])
 
-    # 🔥 FAULT CLASSIFICATION
+    # ---------- FAULT CLASSIFICATION ----------
     fault = "NORMAL"
-
     if z > 3:
         fault = "SEVERE IMBALANCE"
     elif z > 2:
@@ -84,7 +87,31 @@ async def predict(data: dict):
     elif trend == "INCREASING":
         fault = "WEAR DETECTED"
 
-    # RISK
+    # ---------- BATTERY PREDICTION ----------
+    current_time = time.time()
+
+    if battery >= 0:
+        battery_history.append(battery)
+        time_history.append(current_time)
+
+        if len(battery_history) > 20:
+            battery_history.pop(0)
+            time_history.pop(0)
+
+    battery_drain = "N/A"
+
+    if len(battery_history) >= 5:
+        x = np.array(time_history).reshape(-1, 1)
+        y = np.array(battery_history)
+
+        trend_model.fit(x, y)
+        slope = trend_model.coef_[0]
+
+        if slope < 0:
+            minutes_left = abs(battery / slope) / 60
+            battery_drain = f"{int(minutes_left)} min remaining"
+
+    # ---------- RISK ----------
     if health < 45 or z > 3:
         risk = "CRITICAL"
     elif health < 75:
@@ -93,14 +120,15 @@ async def predict(data: dict):
         risk = "NOMINAL"
 
     last_data = {
-        "vibration": round(vib, 3),
         "score": health,
-        "risk": risk,
+        "vibration": round(vib, 3),
         "z_score": round(z, 2),
         "trend": trend,
         "frequency": round(freq, 3),
         "fault": fault,
-        "battery": battery
+        "battery": battery,
+        "battery_drain": battery_drain,
+        "risk": risk
     }
 
     return last_data
@@ -123,42 +151,31 @@ async def monitor():
 <style>
 body {
     margin:0;
-    font-family:Orbitron, sans-serif;
-    background: radial-gradient(circle, #05080a, #000);
+    background:black;
     color:#00ffe7;
+    font-family:sans-serif;
     text-align:center;
-}
-
-h1 {
-    margin:20px;
-    letter-spacing:5px;
 }
 
 .grid {
     display:grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px,1fr));
-    gap:20px;
+    grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+    gap:15px;
     padding:20px;
 }
 
 .card {
-    background: rgba(0,255,255,0.05);
-    border:1px solid rgba(0,255,255,0.2);
-    border-radius:15px;
+    background:#111;
     padding:20px;
-    box-shadow:0 0 20px rgba(0,255,255,0.2);
+    border-radius:10px;
 }
 
-.val {
-    font-size:30px;
-}
-
-.CRITICAL { color:red; }
-.WARNING { color:orange; }
-.NOMINAL { color:#00ffcc; }
-
-.qr {
-    margin-top:20px;
+button {
+    padding:15px;
+    background:#00ffe7;
+    border:none;
+    margin:20px;
+    cursor:pointer;
 }
 </style>
 </head>
@@ -167,34 +184,69 @@ h1 {
 
 <h1>AI NEURAL MONITOR</h1>
 
+<button onclick="startSensors()">START SENSOR</button>
+
 <div class="grid">
-<div class="card"><div class="val" id="health">--%</div><div>Health</div></div>
-<div class="card"><div class="val" id="vib">0</div><div>Vibration</div></div>
-<div class="card"><div class="val" id="z">0</div><div>Z Score</div></div>
-<div class="card"><div class="val" id="trend">--</div><div>Trend</div></div>
-<div class="card"><div class="val" id="freq">0</div><div>Frequency</div></div>
-<div class="card"><div class="val" id="fault">--</div><div>Fault Type</div></div>
-<div class="card"><div class="val" id="battery">--%</div><div>Battery</div></div>
-<div class="card"><div class="val" id="risk">--</div><div>Status</div></div>
+<div class="card"><h2 id="health">--</h2>Health</div>
+<div class="card"><h2 id="vib">--</h2>Vibration</div>
+<div class="card"><h2 id="z">--</h2>Z Score</div>
+<div class="card"><h2 id="trend">--</h2>Trend</div>
+<div class="card"><h2 id="freq">--</h2>Frequency</div>
+<div class="card"><h2 id="fault">--</h2>Fault</div>
+<div class="card"><h2 id="battery">--</h2>Battery</div>
+<div class="card"><h2 id="drain">--</h2>Battery Life</div>
+<div class="card"><h2 id="risk">--</h2>Status</div>
 </div>
 
-<canvas id="chart"></canvas>
-
-<h3>Scan to Monitor on Phone</h3>
-<img class="qr" src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=https://ai-failure-backend.onrender.com">
+<h3>Scan QR</h3>
+<img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=https://ai-failure-backend.onrender.com">
 
 <script>
-const ctx = document.getElementById('chart').getContext('2d');
+let batteryLevel = -1;
 
-const chart = new Chart(ctx, {
-    type:'line',
-    data:{labels:[],datasets:[{label:'Vibration',data:[]}]},
-    options:{animation:false}
-});
+// BATTERY API
+if (navigator.getBattery) {
+    navigator.getBattery().then(function(battery) {
+        function updateBattery() {
+            batteryLevel = Math.round(battery.level * 100);
+        }
+        updateBattery();
+        battery.addEventListener('levelchange', updateBattery);
+    });
+}
 
+// SENSOR START
+function startSensors() {
+    if (typeof DeviceMotionEvent.requestPermission === 'function') {
+        DeviceMotionEvent.requestPermission()
+        .then(p => { if(p === 'granted') activate(); });
+    } else {
+        activate();
+    }
+}
+
+function activate() {
+    window.addEventListener("devicemotion", function(e) {
+        let a = e.accelerationIncludingGravity;
+        if(!a) return;
+
+        let vib = Math.sqrt(a.x*a.x + a.y*a.y + a.z*a.z) - 9.81;
+
+        fetch('/predict', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({
+                vibration: vib,
+                battery: batteryLevel
+            })
+        });
+    });
+}
+
+// UI UPDATE
 async function update(){
-    const r = await fetch('/data');
-    const d = await r.json();
+    let r = await fetch('/data');
+    let d = await r.json();
 
     health.innerText = d.score + "%";
     vib.innerText = d.vibration;
@@ -202,15 +254,11 @@ async function update(){
     trend.innerText = d.trend;
     freq.innerText = d.frequency;
     fault.innerText = d.fault;
-    battery.innerText = d.battery + "%";
+    battery.innerText = d.battery >= 0 ? d.battery + "%" : "N/A";
+    drain.innerText = d.battery_drain;
     risk.innerText = d.risk;
-
-    chart.data.datasets[0].data.push(d.vibration);
-    if(chart.data.datasets[0].data.length>40)
-        chart.data.datasets[0].data.shift();
-
-    chart.update();
 }
+
 setInterval(update,1000);
 </script>
 
