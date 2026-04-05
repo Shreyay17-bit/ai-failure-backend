@@ -1,113 +1,201 @@
-import os, time
+import os
 import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from sklearn.ensemble import IsolationForest, RandomForestClassifier
-from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import IsolationForest
 
 app = FastAPI()
 
-# ── ML MODELS ──────────────────────────────────────────────────
-iforest = IsolationForest(contamination=0.05, random_state=42)
-rf_clf  = RandomForestClassifier(n_estimators=100, random_state=42)
-lr_bat  = LinearRegression()
+# ══════════════════════════════════════════════════════════════
+#  SINGLE ML MODEL: Isolation Forest
+#  Feature vector: [vibration, cpu, ram, battery, temp, disk]
+#
+#  Trained ONLY on healthy data so the model learns the boundary
+#  of "normal". Anything outside that boundary scores higher.
+#
+#  Calibration:
+#    good_thresh = p95 of normal training scores  → maps to 0
+#    bad_thresh  = p5  of synthetic fault scores  → maps to 100
+# ══════════════════════════════════════════════════════════════
 
 rng = np.random.default_rng(42)
-N   = 500
+N   = 1200
 
-# Training data
-X_normal = np.column_stack([
-    rng.uniform(0.0, 0.3,  N),   # vibration
-    rng.uniform(10,  70,   N),   # cpu
-    rng.uniform(20,  75,   N),   # ram
-    rng.uniform(40,  100,  N),   # battery
-    rng.uniform(30,  65,   N),   # temp
-    rng.uniform(10,  80,   N),   # disk
+X_healthy = np.column_stack([
+    rng.uniform(0.00, 0.40, N),   # vibration m/s²
+    rng.uniform(5,    80,   N),   # cpu %
+    rng.uniform(10,   80,   N),   # ram %
+    rng.uniform(25,   100,  N),   # battery %
+    rng.uniform(25,   68,   N),   # temperature °C
+    rng.uniform(5,    80,   N),   # disk %
 ])
-iforest.fit(X_normal)
 
-X_clf = np.vstack([X_normal,
-    np.column_stack([rng.uniform(0.8,2.0,50), rng.uniform(10,70,50), rng.uniform(20,75,50), rng.uniform(40,100,50), rng.uniform(30,65,50), rng.uniform(10,80,50)]),
-    np.column_stack([rng.uniform(0.0,0.3,50), rng.uniform(10,70,50), rng.uniform(20,75,50), rng.uniform(40,100,50), rng.uniform(70,100,50), rng.uniform(10,80,50)]),
-    np.column_stack([rng.uniform(0.4,0.8,50), rng.uniform(10,70,50), rng.uniform(20,75,50), rng.uniform(40,100,50), rng.uniform(30,65,50), rng.uniform(10,80,50)]),
-    np.column_stack([rng.uniform(0.0,0.3,50), rng.uniform(80,100,50), rng.uniform(85,100,50), rng.uniform(40,100,50), rng.uniform(30,65,50), rng.uniform(10,80,50)]),
-    np.column_stack([rng.uniform(0.0,0.3,50), rng.uniform(10,70,50), rng.uniform(20,75,50), rng.uniform(5,20,50), rng.uniform(30,65,50), rng.uniform(10,80,50)]),
+iforest = IsolationForest(contamination=0.02, n_estimators=200, random_state=42)
+iforest.fit(X_healthy)
+
+# calibrate thresholds against training data + synthetic faults
+_s_h = iforest.score_samples(X_healthy)
+GOOD_THRESH = float(np.percentile(_s_h, 95))
+
+X_fault = np.column_stack([
+    rng.uniform(1.5, 3.0, 300), rng.uniform(88, 100, 300),
+    rng.uniform(88, 100, 300),  rng.uniform(1,   10, 300),
+    rng.uniform(85, 100, 300),  rng.uniform(88, 100, 300),
 ])
-y_clf = np.array([0]*N + [1]*50 + [2]*50 + [3]*50 + [4]*50 + [5]*50)
-rf_clf.fit(X_clf, y_clf)
+_s_f = iforest.score_samples(X_fault)
+BAD_THRESH = float(np.percentile(_s_f, 5))
 
-t = np.arange(N).reshape(-1, 1)
-bat_vals = 100 - (t.flatten() * 0.05) + rng.normal(0, 2, N)
-lr_bat.fit(t, bat_vals)
+def if_score(vec: list) -> float:
+    """Raw IF output mapped to 0–100 (0=healthy, 100=extreme anomaly)."""
+    raw = float(iforest.score_samples([vec])[0])
+    return float(np.clip(
+        (GOOD_THRESH - raw) / (GOOD_THRESH - BAD_THRESH) * 100,
+        0, 100
+    ))
 
-FAULT_NAMES = ["NORMAL","BEARING_FAULT","OVERHEATING","MISALIGNMENT","WEAR_OVERLOAD","LOW_POWER"]
+def rule_penalty(vib, cpu, ram, bat, temp, disk) -> int:
+    """Rule-based additive penalty covering IF blind-spots (battery, temp)."""
+    p = 0
+    if   bat  <  5:  p += 50
+    elif bat  < 15:  p += 35
+    elif bat  < 25:  p += 18
+    if   vib  > 1.8: p += 35
+    elif vib  > 1.0: p += 20
+    elif vib  > 0.6: p += 8
+    if   temp > 85:  p += 30
+    elif temp > 75:  p += 15
+    elif temp > 70:  p += 6
+    if   cpu  > 95:  p += 18
+    elif cpu  > 88:  p += 8
+    if   ram  > 95:  p += 12
+    elif ram  > 90:  p += 5
+    if   disk > 95:  p += 10
+    elif disk > 90:  p += 4
+    return min(p, 60)
 
-all_devices: dict = {}
-history: list    = []
+def classify_fault(vib, cpu, ram, bat, temp, disk, score):
+    if score < 30:
+        return "NORMAL"
+    candidates = {
+        "BEARING FAULT":   vib  * 30,
+        "OVERHEATING":     (temp - 40) * 1.5 + cpu * 0.2,
+        "MEMORY OVERLOAD": ram  * 0.8  + cpu * 0.3,
+        "LOW POWER":       max(0, (30 - bat) * 2.5),
+        "DISK PRESSURE":   disk * 0.7,
+    }
+    return max(candidates, key=candidates.get)
 
-# ── PREDICT ENDPOINT ──────────────────────────────────────────
+all_devices:    dict = {}
+device_history: dict = {}
+
+
 @app.post("/predict")
 async def predict(data: dict):
-    global history
-    vib   = float(data.get("vibration", 0.1))
-    cpu   = float(data.get("cpu_load",  30))
-    ram   = float(data.get("memory",    40))
-    bat   = float(data.get("battery",   90))
-    temp  = float(data.get("temperature", 45))
-    disk  = float(data.get("disk_usage",  50))
-    dev   = str(data.get("device_type", "Unknown"))
+    vib  = float(data.get("vibration",   0.1))
+    cpu  = float(data.get("cpu_load",    30))
+    ram  = float(data.get("memory",      45))
+    bat  = float(data.get("battery",     85))
+    temp = float(data.get("temperature", 42))
+    disk = float(data.get("disk_usage",  50))
+    dev  = str(data.get("device_type",   "Unknown"))
 
-    vec   = [[vib, cpu, ram, bat, temp, disk]]
-    score = iforest.score_samples(vec)[0]
-    anom  = max(0, min(100, int((1 - (score + 0.5)) * 100)))
-    fault = FAULT_NAMES[int(rf_clf.predict(vec)[0])]
-    proba = float(rf_clf.predict_proba(vec)[0].max()) * 100
-    slope = float(lr_bat.coef_[0])
-    rul   = max(0, int(bat / max(0.01, abs(slope)))) if slope < 0 else 999
+    # 1. IF component (0–100)
+    if_comp = if_score([vib, cpu, ram, bat, temp, disk])
 
-    if anom >= 70:
-        risk, status = "CRITICAL", "CRITICAL FAILURE"
-        recs = ["HALT OPERATIONS — immediate inspection required",
-                f"Fault signature: {fault} detected at {proba:.0f}% confidence",
-                "Check bearing assemblies and lubrication channels",
-                "Isolate affected subsystem before restart"]
-    elif anom >= 40:
-        risk, status = "WARNING", "MAINTENANCE ADVISORY"
-        recs = [f"Schedule maintenance within 24h — {fault} pattern emerging",
-                "Monitor vibration trend — currently elevated",
-                f"Battery RUL estimate: {rul}h at current drain rate",
-                "Inspect cooling system — thermal margins shrinking"]
+    # 2. Rule penalty (0–60 raw, scaled to 0–100)
+    penalty = rule_penalty(vib, cpu, ram, bat, temp, disk)
+
+    # 3. Weighted combination: IF 60%, rules 40%
+    raw = if_comp * 0.60 + (penalty / 60 * 100) * 0.40
+    health_score = int(np.clip(raw, 0, 100))
+
+    # 4. Sanity cap: if every metric is clearly fine, can't be CRITICAL
+    all_fine = (vib < 0.45 and cpu < 85 and ram < 85
+                and bat > 22 and temp < 72 and disk < 88)
+    if all_fine:
+        health_score = min(health_score, 28)
+
+    fault = classify_fault(vib, cpu, ram, bat, temp, disk, health_score)
+
+    # Battery drain rate from history
+    dev_hist = device_history.get(dev, [])
+    if len(dev_hist) >= 3:
+        bats = [h["bat"] for h in dev_hist[-6:]]
+        drain_per_scan = (bats[0] - bats[-1]) / len(bats)
+        drain_per_hour = drain_per_scan * (3600 / 4)
+        rul_h     = int(bat / drain_per_hour) if drain_per_hour > 0.1 else 999
+        bat_trend = ("RISING"  if drain_per_scan < -0.2 else
+                     "DRAINING" if drain_per_scan >  0.2 else "STABLE")
     else:
-        risk, status = "NOMINAL", "ALL SYSTEMS NOMINAL"
-        recs = ["Continue standard monitoring intervals",
-                f"Next scheduled check in {min(168, rul)}h",
-                "No anomalies detected by Isolation Forest",
-                "System operating within design envelope"]
+        rul_h, bat_trend = 999, "STABLE"
 
-    trend = "RISING" if slope > 0.01 else "FALLING" if slope < -0.01 else "STABLE"
-    result = dict(vibration=round(vib,3), cpu_load=cpu, memory=ram,
-                  battery=bat, temperature=temp, disk_usage=disk,
-                  device=dev, anomaly_score=anom, fault=fault,
-                  fault_confidence=round(proba,1), risk=risk, status=status,
-                  rul_hours=rul, trend=trend, recommendations=recs,
-                  z_score=round((vib-0.15)/0.1, 2))
+    # Human-readable labels
+    vib_health = ("SMOOTH" if vib < 0.15 else "NORMAL" if vib < 0.40 else
+                  "ELEVATED" if vib < 0.70 else "HIGH" if vib < 1.20 else "CRITICAL")
+    thermal    = ("COOL" if temp < 40 else "NORMAL" if temp < 60 else
+                  "WARM" if temp < 72 else "HOT" if temp < 82 else "OVERHEATING")
+
+    if health_score >= 65:
+        risk, status = "CRITICAL", "CRITICAL — IMMEDIATE ACTION"
+        recs = [
+            f"HALT OPERATIONS — primary fault detected: {fault}",
+            f"Health score {health_score}/100 exceeds critical threshold (65)",
+            "Inspect mechanical and thermal subsystems before restart",
+            f"Battery at {bat:.0f}% — {'replace immediately' if bat < 15 else 'monitor closely'}",
+        ]
+    elif health_score >= 35:
+        risk, status = "WARNING", "ADVISORY — SCHEDULE MAINTENANCE"
+        recs = [
+            f"Fault signature detected: {fault}",
+            f"Health score {health_score}/100 — above normal range (35–64)",
+            f"Battery life estimate: {'stable' if rul_h == 999 else str(rul_h) + 'h remaining'}",
+            f"Vibration: {vib_health} — {'inspect bearings' if vib > 0.5 else 'continue monitoring'}",
+        ]
+    else:
+        risk, status = "NOMINAL", "NOMINAL — ALL SYSTEMS HEALTHY"
+        recs = [
+            f"All parameters within healthy envelope — score {health_score}/100",
+            f"Vibration: {vib_health}  ·  Thermal: {thermal}  ·  Battery: {bat:.0f}%",
+            f"Battery life: {'stable / charging' if rul_h == 999 else str(rul_h) + 'h at current drain rate'}",
+            "Continue standard monitoring intervals",
+        ]
+
+    result = dict(
+        vibration=round(vib,3), cpu_load=round(cpu,1),
+        memory=round(ram,1),    battery=round(bat,1),
+        temperature=round(temp,1), disk_usage=round(disk,1),
+        device=dev,
+        health_score=health_score,
+        if_component=round(if_comp,1),
+        penalty=penalty,
+        fault=fault, risk=risk, status=status,
+        rul_hours=rul_h, bat_trend=bat_trend,
+        vib_health=vib_health, thermal=thermal,
+        recommendations=recs,
+    )
 
     all_devices[dev] = result
-    history.append(anom)
-    if len(history) > 30:
-        history.pop(0)
+    device_history.setdefault(dev, []).append(
+        {"bat": bat, "score": health_score, "cpu": cpu, "vib": vib}
+    )
+    if len(device_history[dev]) > 30:
+        device_history[dev].pop(0)
+
     return result
+
 
 @app.get("/data")
 async def data():
     latest = list(all_devices.values())[-1] if all_devices else {}
-    return {**latest, "history": history, "all_devices": all_devices}
+    per_dev_hist = {k: [h["score"] for h in v] for k, v in device_history.items()}
+    return {**latest, "per_dev_hist": per_dev_hist, "all_devices": all_devices}
+
 
 @app.get("/")
 async def root():
-    return {"status": "online", "version": "2.0.0"}
+    return {"status": "online", "version": "3.0.0", "model": "IsolationForest"}
 
-# ── MONITOR DASHBOARD ─────────────────────────────────────────
+
 @app.get("/monitor", response_class=HTMLResponse)
 async def monitor():
     return r"""<!DOCTYPE html>
@@ -120,1108 +208,575 @@ async def monitor():
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Bebas+Neue&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
 :root {
-  --bg:      #0c0b08;
-  --surface: #131210;
-  --border:  #2a2720;
-  --amber:   #e8a020;
-  --amber2:  #c47a10;
-  --amber-lo:#3a2800;
-  --red:     #d63c2a;
-  --red-lo:  #3a0e08;
-  --green:   #4a8c5c;
-  --green-lo:#0d2218;
-  --text:    #d4c8a8;
-  --muted:   #6b6048;
+  --bg:       #0c0b08;
+  --surface:  #141310;
+  --surface2: #1c1a16;
+  --border:   #2e2b24;
+  --border2:  #3d3a30;
+  --amber:    #f0a830;
+  --amber2:   #d48a18;
+  --amber-lo: #3a2800;
+  --amber-hi: #ffe0a0;
+  --red:      #e04030;
+  --red-lo:   #3a0e08;
+  --red-hi:   #ff9080;
+  --green:    #5ab870;
+  --green-lo: #0d2a18;
+  --green-hi: #a0f0b8;
+  --yellow:   #e8c040;
+  --text:     #e8dfc8;
+  --text2:    #a89880;
+  --muted:    #6a5e48;
   --mono:    'Share Tech Mono', monospace;
   --display: 'Bebas Neue', cursive;
   --body:    'DM Sans', sans-serif;
 }
-
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-html { font-size: 14px; }
-
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--body);
-  min-height: 100vh;
-  overflow-x: hidden;
-}
-
-/* Scanline overlay */
-body::after {
-  content: '';
-  position: fixed;
-  inset: 0;
-  background: repeating-linear-gradient(
-    0deg,
-    transparent,
-    transparent 2px,
-    rgba(0,0,0,0.06) 2px,
-    rgba(0,0,0,0.06) 4px
-  );
-  pointer-events: none;
-  z-index: 9999;
-}
-
-/* ── HEADER ── */
-header {
-  display: flex;
-  align-items: stretch;
-  border-bottom: 2px solid var(--border);
-  background: var(--surface);
-}
-
-.header-brand {
-  padding: 18px 32px;
-  border-right: 2px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.brand-label {
-  font-family: var(--mono);
-  font-size: 9px;
-  letter-spacing: 4px;
-  color: var(--muted);
-  text-transform: uppercase;
-}
-
-.brand-name {
-  font-family: var(--display);
-  font-size: 38px;
-  color: var(--amber);
-  line-height: 1;
-  letter-spacing: 3px;
-}
-
-.header-status {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  padding: 0 32px;
-  gap: 32px;
-}
-
-.status-pill {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 2px;
-  color: var(--muted);
-}
-
-.dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--green);
-  animation: pulse-dot 2s ease-in-out infinite;
-}
-
-@keyframes pulse-dot {
-  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(74,140,92,0.4); }
-  50%       { opacity: 0.7; box-shadow: 0 0 0 4px rgba(74,140,92,0); }
-}
-
-.header-time {
-  margin-left: auto;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--muted);
-  text-align: right;
-  line-height: 1.8;
-}
-
-/* ── LAYOUT ── */
-.shell {
-  display: grid;
-  grid-template-columns: 320px 1fr;
-  min-height: calc(100vh - 80px);
-}
-
-.left-panel {
-  border-right: 2px solid var(--border);
-  display: flex;
-  flex-direction: column;
-}
-
-/* ── SECTION HEADERS ── */
-.sec-hdr {
-  padding: 12px 20px;
-  border-bottom: 1px solid var(--border);
-  font-family: var(--mono);
-  font-size: 9px;
-  letter-spacing: 4px;
-  color: var(--muted);
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  background: var(--surface);
-  text-transform: uppercase;
-}
-
-.sec-hdr::before {
-  content: '';
-  display: block;
-  width: 3px;
-  height: 10px;
-  background: var(--amber);
-}
-
-/* ── RISK METER ── */
-.risk-block {
-  padding: 28px 24px 24px;
-  border-bottom: 1px solid var(--border);
-}
-
-.risk-label {
-  font-family: var(--mono);
-  font-size: 9px;
-  letter-spacing: 3px;
-  color: var(--muted);
-  margin-bottom: 16px;
-}
-
-.risk-arc-wrap {
-  position: relative;
-  width: 200px;
-  height: 120px;
-  margin: 0 auto 16px;
-}
-
-.risk-arc-wrap svg { width: 100%; height: 100%; overflow: visible; }
-
-.risk-score-big {
-  position: absolute;
-  bottom: 0;
-  left: 50%;
-  transform: translateX(-50%);
-  text-align: center;
-}
-
-.risk-num {
-  font-family: var(--display);
-  font-size: 56px;
-  line-height: 1;
-  color: var(--amber);
-  transition: color 0.5s;
-}
-
-.risk-unit {
-  font-family: var(--mono);
-  font-size: 9px;
-  letter-spacing: 2px;
-  color: var(--muted);
-}
-
-.risk-badge {
-  display: block;
-  margin: 14px auto 0;
-  width: fit-content;
-  padding: 6px 18px;
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 3px;
-  border: 1px solid var(--amber);
-  color: var(--amber);
-  background: var(--amber-lo);
-  transition: all 0.4s;
-}
-
-/* ── MINI GAUGES ── */
-.gauges-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1px;
-  background: var(--border);
-  border-top: 1px solid var(--border);
-}
-
-.gauge-cell {
-  background: var(--bg);
-  padding: 16px;
-}
-
-.gc-label {
-  font-family: var(--mono);
-  font-size: 8px;
-  letter-spacing: 2px;
-  color: var(--muted);
-  margin-bottom: 8px;
-}
-
-.gc-value {
-  font-family: var(--display);
-  font-size: 28px;
-  color: var(--text);
-  line-height: 1;
-  margin-bottom: 8px;
-}
-
-.gc-bar {
-  height: 3px;
-  background: var(--border);
-  border-radius: 2px;
-  overflow: hidden;
-}
-
-.gc-fill {
-  height: 100%;
-  background: var(--amber);
-  transition: width 0.8s cubic-bezier(0.4,0,0.2,1);
-}
-
-/* ── FAULT CARD ── */
-.fault-block {
-  padding: 20px 24px;
-  border-bottom: 1px solid var(--border);
-}
-
-.fault-name {
-  font-family: var(--display);
-  font-size: 22px;
-  letter-spacing: 2px;
-  color: var(--text);
-  margin-bottom: 4px;
-}
-
-.fault-conf {
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--muted);
-}
-
-.fault-conf span { color: var(--amber); }
-
-/* ── MODE SWITCHER ── */
-.mode-tabs {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 1px;
-  background: var(--border);
-  border-bottom: 1px solid var(--border);
-}
-
-.mode-tab {
-  padding: 12px 8px;
-  background: var(--bg);
-  font-family: var(--mono);
-  font-size: 9px;
-  letter-spacing: 1px;
-  color: var(--muted);
-  border: none;
-  cursor: pointer;
-  transition: all 0.2s;
-  text-align: center;
-  text-transform: uppercase;
-}
-
-.mode-tab:hover { background: var(--surface); color: var(--text); }
-.mode-tab.active { background: var(--amber-lo); color: var(--amber); }
-
-/* ── FORM FIELDS ── */
-.input-panel {
-  padding: 20px;
-  border-bottom: 1px solid var(--border);
-  display: none;
-}
-
-.input-panel.active { display: block; }
-
-.field-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-  margin-bottom: 10px;
-}
-
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.field label {
-  font-family: var(--mono);
-  font-size: 8px;
-  letter-spacing: 2px;
-  color: var(--muted);
-  text-transform: uppercase;
-}
-
-.field input {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  color: var(--text);
-  font-family: var(--mono);
-  font-size: 13px;
-  padding: 8px 10px;
-  outline: none;
-  transition: border-color 0.2s;
-  width: 100%;
-}
-
-.field input:focus { border-color: var(--amber); }
-
-.scan-btn {
-  width: 100%;
-  padding: 12px;
-  background: var(--amber);
-  border: none;
-  color: #0c0b08;
-  font-family: var(--display);
-  font-size: 18px;
-  letter-spacing: 3px;
-  cursor: pointer;
-  margin-top: 8px;
-  transition: background 0.2s, transform 0.1s;
-}
-
-.scan-btn:hover  { background: var(--amber2); }
-.scan-btn:active { transform: scale(0.99); }
-
-/* ── LIVE AUTO PANEL ── */
-.live-panel {
-  padding: 20px;
-  border-bottom: 1px solid var(--border);
-  display: none;
-}
-
-.live-panel.active { display: block; }
-
-.live-row {
-  display: flex;
-  justify-content: space-between;
-  font-family: var(--mono);
-  font-size: 10px;
-  padding: 7px 0;
-  border-bottom: 1px solid var(--border);
-  color: var(--muted);
-}
-
-.live-row span:last-child { color: var(--text); }
-
-.live-ping {
-  margin-top: 12px;
-  font-family: var(--mono);
-  font-size: 9px;
-  letter-spacing: 2px;
-  color: var(--muted);
-}
-
-.live-ping span {
-  display: inline-block;
-  animation: blink-txt 1s step-start infinite;
-  color: var(--amber);
-}
-
-@keyframes blink-txt { 50% { opacity: 0; } }
-
-/* ── RIGHT PANEL ── */
-.right-panel {
-  display: flex;
-  flex-direction: column;
-}
-
-/* ── RECOMMENDATION STRIP ── */
-.rec-strip {
-  border-bottom: 1px solid var(--border);
-  padding: 20px 32px;
-  background: var(--surface);
-}
-
-.rec-title {
-  font-family: var(--mono);
-  font-size: 8px;
-  letter-spacing: 3px;
-  color: var(--muted);
-  margin-bottom: 14px;
-}
-
-.rec-list {
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.rec-list li {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--text);
-}
-
-.rec-num {
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--amber);
-  min-width: 20px;
-  padding-top: 1px;
-}
-
-/* ── CHARTS ROW ── */
-.charts-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 1px;
-  background: var(--border);
-  flex: 1;
-}
-
-.chart-block {
-  background: var(--bg);
-  padding: 20px;
-  min-height: 180px;
-  display: flex;
-  flex-direction: column;
-}
-
-.chart-title {
-  font-family: var(--mono);
-  font-size: 8px;
-  letter-spacing: 3px;
-  color: var(--muted);
-  margin-bottom: 16px;
-  text-transform: uppercase;
-}
-
-.spark-area {
-  flex: 1;
-  display: flex;
-  align-items: flex-end;
-  gap: 3px;
-}
-
-.spark-col {
-  flex: 1;
-  min-width: 4px;
-  border-radius: 1px 1px 0 0;
-  transition: height 0.4s ease;
-}
-
-/* ── DEVICE TABS ── */
-.dev-tabs {
-  display: flex;
-  gap: 1px;
-  background: var(--border);
-  padding: 0;
-  border-bottom: 1px solid var(--border);
-}
-
-.dev-tab {
-  padding: 8px 20px;
-  background: var(--bg);
-  font-family: var(--mono);
-  font-size: 9px;
-  letter-spacing: 2px;
-  color: var(--muted);
-  border: none;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-
-.dev-tab:hover  { background: var(--surface); color: var(--text); }
-.dev-tab.active { background: var(--surface); color: var(--amber); border-bottom: 2px solid var(--amber); }
-
-/* ── METADATA ROW ── */
-.meta-row {
-  display: flex;
-  border-top: 1px solid var(--border);
-  background: var(--surface);
-}
-
-.meta-cell {
-  flex: 1;
-  padding: 12px 24px;
-  border-right: 1px solid var(--border);
-}
-
-.meta-cell:last-child { border-right: none; }
-
-.meta-k {
-  font-family: var(--mono);
-  font-size: 8px;
-  letter-spacing: 2px;
-  color: var(--muted);
-  margin-bottom: 4px;
-}
-
-.meta-v {
-  font-family: var(--mono);
-  font-size: 13px;
-  color: var(--text);
-}
-
-/* ── STATUS STATES ── */
-.nominal  .risk-num { color: var(--green); }
-.nominal  .risk-badge { border-color: var(--green); color: var(--green); background: var(--green-lo); }
-
-.critical .risk-num { color: var(--red); }
-.critical .risk-badge { border-color: var(--red); color: var(--red); background: var(--red-lo); animation: flash-badge 0.8s ease-in-out infinite; }
-
-@keyframes flash-badge { 50% { opacity: 0.5; } }
-
-/* ── EMPTY STATE ── */
-.empty-state {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  flex: 1;
-  padding: 60px 32px;
-  gap: 16px;
-  color: var(--muted);
-}
-
-.empty-state .big-label {
-  font-family: var(--display);
-  font-size: 64px;
-  color: var(--border);
-  letter-spacing: 6px;
-}
-
-.empty-state p {
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 2px;
-  text-align: center;
-  line-height: 2;
-}
-
-/* ── RESPONSIVE ── */
-@media (max-width: 900px) {
-  .shell { grid-template-columns: 1fr; }
-  .right-panel { border-top: 2px solid var(--border); }
-  .charts-row { grid-template-columns: 1fr; }
-  .meta-row { flex-wrap: wrap; }
-}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{font-size:14px}
+body{background:var(--bg);color:var(--text);font-family:var(--body);min-height:100vh;overflow-x:hidden}
+body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,0.04) 3px,rgba(0,0,0,0.04) 4px);pointer-events:none;z-index:9999}
+
+header{display:flex;align-items:stretch;border-bottom:2px solid var(--border);background:var(--surface)}
+.hdr-brand{padding:16px 28px;border-right:2px solid var(--border);display:flex;flex-direction:column;gap:1px}
+.hdr-label{font-family:var(--mono);font-size:8px;letter-spacing:4px;color:var(--muted);text-transform:uppercase}
+.hdr-name{font-family:var(--display);font-size:36px;color:var(--amber);line-height:1;letter-spacing:3px}
+.hdr-right{flex:1;display:flex;align-items:center;padding:0 28px;gap:28px;flex-wrap:wrap}
+.hdr-pill{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:10px;letter-spacing:2px;color:var(--muted)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pdot 2.4s ease-in-out infinite}
+@keyframes pdot{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(90,184,112,.4)}50%{opacity:.7;box-shadow:0 0 0 5px rgba(90,184,112,0)}}
+.hdr-time{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--muted);text-align:right;line-height:2}
+
+.shell{display:grid;grid-template-columns:300px 1fr;min-height:calc(100vh - 75px)}
+.left-col{border-right:2px solid var(--border);display:flex;flex-direction:column}
+.right-col{display:flex;flex-direction:column}
+
+.sec{padding:10px 18px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:8px;letter-spacing:4px;color:var(--muted);background:var(--surface);display:flex;align-items:center;gap:8px;text-transform:uppercase}
+.sec::before{content:'';display:block;width:3px;height:9px;background:var(--amber);border-radius:1px}
+
+/* gauge */
+.gauge-wrap{padding:22px 20px 18px;border-bottom:1px solid var(--border)}
+.gauge-sub{font-family:var(--mono);font-size:8px;letter-spacing:3px;color:var(--muted);margin-bottom:14px}
+.arc-outer{position:relative;width:190px;height:110px;margin:0 auto 14px}
+.arc-outer svg{width:100%;height:100%;overflow:visible}
+.score-center{position:absolute;bottom:4px;left:50%;transform:translateX(-50%);text-align:center}
+.score-num{font-family:var(--display);font-size:52px;line-height:1;color:var(--amber);transition:color .5s}
+.score-denom{font-family:var(--mono);font-size:9px;color:var(--muted)}
+.badge{display:block;margin:12px auto 0;width:fit-content;padding:5px 22px;font-family:var(--mono);font-size:10px;letter-spacing:3px;border:1.5px solid var(--amber);color:var(--amber);background:var(--amber-lo);transition:all .4s;text-align:center}
+.badge.critical{border-color:var(--red);color:var(--red-hi);background:var(--red-lo);animation:flash .9s ease-in-out infinite}
+.badge.nominal{border-color:var(--green);color:var(--green-hi);background:var(--green-lo)}
+@keyframes flash{50%{opacity:.35}}
+
+/* metric grid */
+.metric-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border)}
+.metric-cell{background:var(--bg);padding:14px 16px}
+.mc-label{font-family:var(--mono);font-size:8px;letter-spacing:2px;color:var(--muted);margin-bottom:6px}
+.mc-value{font-family:var(--display);font-size:26px;color:var(--text);line-height:1;margin-bottom:5px}
+.mc-value.warn{color:var(--yellow)} .mc-value.bad{color:var(--red-hi)} .mc-value.good{color:var(--green-hi)}
+.mc-tag{font-family:var(--mono);font-size:8px;letter-spacing:1px;color:var(--muted)}
+.bar{height:3px;background:var(--border2);border-radius:2px;overflow:hidden;margin-top:6px}
+.bar-fill{height:100%;background:var(--green);border-radius:2px;transition:width .8s cubic-bezier(.4,0,.2,1)}
+
+/* fault */
+.fault-block{padding:16px 20px;border-bottom:1px solid var(--border)}
+.fault-name{font-family:var(--display);font-size:20px;letter-spacing:2px;color:var(--text);margin-bottom:4px}
+.fault-sub{font-family:var(--mono);font-size:9px;color:var(--muted);line-height:1.8}
+
+/* mode tabs */
+.mode-tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border)}
+.mode-tab{padding:11px 6px;background:var(--bg);font-family:var(--mono);font-size:8px;letter-spacing:1px;color:var(--muted);border:none;cursor:pointer;transition:all .2s;text-align:center;text-transform:uppercase}
+.mode-tab:hover{background:var(--surface2);color:var(--text2)}
+.mode-tab.on{background:var(--amber-lo);color:var(--amber)}
+
+/* input panels */
+.ipanel{padding:16px;border-bottom:1px solid var(--border);display:none}
+.ipanel.on{display:block}
+.frow{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
+.field{display:flex;flex-direction:column;gap:3px}
+.field label{font-family:var(--mono);font-size:7px;letter-spacing:2px;color:var(--muted);text-transform:uppercase}
+.field input{background:var(--surface);border:1px solid var(--border2);color:var(--text);font-family:var(--mono);font-size:13px;padding:8px 10px;outline:none;transition:border-color .2s;width:100%}
+.field input:focus{border-color:var(--amber)}
+.go-btn{width:100%;padding:11px;background:var(--amber);border:none;color:#0c0b08;font-family:var(--display);font-size:17px;letter-spacing:3px;cursor:pointer;margin-top:6px;transition:background .15s,transform .1s}
+.go-btn:hover{background:var(--amber2)}
+.go-btn:active{transform:scale(.99)}
+
+/* live panel */
+.live-panel{padding:16px;border-bottom:1px solid var(--border);display:none}
+.live-panel.on{display:block}
+.lrow{display:flex;justify-content:space-between;align-items:center;font-family:var(--mono);font-size:9px;padding:7px 0;border-bottom:1px solid var(--border)}
+.lrow:last-of-type{border:none}
+.lrow .lk{color:var(--muted)} .lrow .lv{color:var(--text)}
+.live-ping{font-family:var(--mono);font-size:8px;color:var(--muted);margin-top:10px}
+.blink{animation:flash 1s step-start infinite;color:var(--amber)}
+#ios-wrap{display:none;margin-top:10px}
+.ios-btn{width:100%;padding:9px;background:transparent;border:1px solid var(--border2);color:var(--text2);font-family:var(--mono);font-size:9px;letter-spacing:2px;cursor:pointer;transition:all .2s}
+.ios-btn:hover{border-color:var(--amber);color:var(--amber)}
+.ios-note{font-family:var(--mono);font-size:8px;color:var(--muted);margin-top:6px;line-height:1.7}
+
+/* right column */
+.dev-tabs{display:flex;gap:1px;background:var(--border);border-bottom:1px solid var(--border)}
+.dev-tab{padding:8px 18px;background:var(--bg);font-family:var(--mono);font-size:8px;letter-spacing:2px;color:var(--muted);border:none;cursor:pointer;transition:all .15s;border-bottom:2px solid transparent}
+.dev-tab:hover{background:var(--surface);color:var(--text2)}
+.dev-tab.on{background:var(--surface);color:var(--amber);border-bottom-color:var(--amber)}
+
+.recs-block{padding:20px 28px;border-bottom:1px solid var(--border);background:var(--surface)}
+.recs-title{font-family:var(--mono);font-size:8px;letter-spacing:3px;color:var(--muted);margin-bottom:12px;text-transform:uppercase}
+.recs-list{list-style:none;display:flex;flex-direction:column;gap:9px}
+.recs-list li{display:flex;align-items:flex-start;gap:12px;font-size:12.5px;line-height:1.55;color:var(--text)}
+.rnum{font-family:var(--mono);font-size:10px;color:var(--amber);min-width:24px;padding-top:1px}
+
+.charts-row{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border);flex:1}
+.chart-block{background:var(--bg);padding:18px;min-height:160px;display:flex;flex-direction:column}
+.chart-title{font-family:var(--mono);font-size:8px;letter-spacing:3px;color:var(--muted);margin-bottom:4px;text-transform:uppercase}
+.chart-sub{font-family:var(--mono);font-size:9px;color:var(--text2);margin-bottom:14px}
+.spark{flex:1;display:flex;align-items:flex-end;gap:3px}
+.spark-bar{flex:1;min-width:4px;border-radius:1px 1px 0 0;transition:height .4s ease}
+
+.meta-row{display:flex;border-top:1px solid var(--border);background:var(--surface)}
+.mcell{flex:1;padding:12px 20px;border-right:1px solid var(--border)}
+.mcell:last-child{border:none}
+.mk{font-family:var(--mono);font-size:7px;letter-spacing:2px;color:var(--muted);margin-bottom:5px;text-transform:uppercase}
+.mv{font-family:var(--mono);font-size:12px;color:var(--text);display:flex;align-items:center;gap:6px}
+.tag{display:inline-block;padding:2px 8px;font-family:var(--mono);font-size:8px;letter-spacing:1px;border-radius:2px}
+.tag-n{background:var(--green-lo);color:var(--green-hi)}
+.tag-w{background:var(--amber-lo);color:var(--amber)}
+.tag-c{background:var(--red-lo);color:var(--red-hi)}
+
+/* model explainer */
+.explainer{padding:12px 20px;border-bottom:1px solid var(--border);background:var(--surface2)}
+.exp-title{font-family:var(--mono);font-size:8px;letter-spacing:3px;color:var(--muted);margin-bottom:8px}
+.exp-row{display:flex;gap:10px;align-items:center;margin-bottom:6px}
+.exp-lbl{font-family:var(--mono);font-size:9px;color:var(--muted);min-width:110px}
+.exp-bar-wrap{flex:1;height:6px;background:var(--border2);border-radius:3px;overflow:hidden}
+.exp-bar{height:100%;border-radius:3px;transition:width .8s}
+.exp-val{font-family:var(--mono);font-size:9px;color:var(--text2);min-width:40px;text-align:right}
+
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;padding:60px 32px;gap:14px}
+.empty .big{font-family:var(--display);font-size:60px;color:var(--border2);letter-spacing:6px}
+.empty p{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-align:center;color:var(--muted);line-height:2.2}
+
+@media(max-width:860px){.shell{grid-template-columns:1fr}.right-col{border-top:2px solid var(--border)}.charts-row{grid-template-columns:1fr}.meta-row{flex-wrap:wrap}}
 </style>
 </head>
 <body>
 
 <header>
-  <div class="header-brand">
-    <span class="brand-label">System</span>
-    <span class="brand-name">NEXUS</span>
+  <div class="hdr-brand">
+    <span class="hdr-label">Predictive Maintenance</span>
+    <span class="hdr-name">NEXUS</span>
   </div>
-  <div class="header-status">
-    <div class="status-pill">
-      <span class="dot" id="conn-dot"></span>
-      <span id="conn-label">CONNECTING</span>
-    </div>
-    <div class="status-pill" style="gap:6px">
-      <span style="color:var(--muted)">DEVICES —</span>
-      <span id="dev-count" style="color:var(--amber)">0</span>
-    </div>
-    <div class="header-time">
-      <div id="clock">--:--:--</div>
-      <div id="date-line" style="opacity:0.4"></div>
-    </div>
+  <div class="hdr-right">
+    <div class="hdr-pill"><span class="dot"></span><span id="conn-lbl">CONNECTING</span></div>
+    <div class="hdr-pill">MODEL <span style="color:var(--amber)">ISOLATION FOREST</span></div>
+    <div class="hdr-pill">DEVICES <span id="dev-count" style="color:var(--amber)">0</span></div>
+    <div class="hdr-time"><div id="clock">--:--:--</div><div id="dline" style="opacity:.4"></div></div>
   </div>
 </header>
 
 <div class="shell">
 
-  <!-- LEFT PANEL -->
-  <div class="left-panel">
+  <div class="left-col">
 
-    <div class="sec-hdr">Anomaly Score</div>
-    <div class="risk-block" id="risk-state">
-      <div class="risk-label">ISOLATION FOREST · PREDICTIVE INDEX</div>
-      <div class="risk-arc-wrap">
-        <svg viewBox="0 0 200 110" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <!-- Track -->
-          <path d="M 20 100 A 80 80 0 0 1 180 100" stroke="#2a2720" stroke-width="8" stroke-linecap="round"/>
-          <!-- Fill -->
-          <path id="arc-fill" d="M 20 100 A 80 80 0 0 1 180 100" stroke="#e8a020"
-                stroke-width="8" stroke-linecap="round"
+    <div class="sec">Health Score</div>
+    <div class="gauge-wrap">
+      <div class="gauge-sub">ISOLATION FOREST · 0 = HEALTHY · 100 = CRITICAL</div>
+      <div class="arc-outer">
+        <svg viewBox="0 0 190 108" fill="none">
+          <path d="M 15 100 A 80 80 0 0 1 175 100" stroke="#2e2b24" stroke-width="9" stroke-linecap="round"/>
+          <path id="arc" d="M 15 100 A 80 80 0 0 1 175 100"
+                stroke="#f0a830" stroke-width="9" stroke-linecap="round"
                 stroke-dasharray="251.2" stroke-dashoffset="251.2"
-                style="transition: stroke-dashoffset 1s cubic-bezier(0.4,0,0.2,1), stroke 0.5s"/>
-          <!-- Ticks -->
-          <g stroke="#2a2720" stroke-width="1">
-            <line x1="20"  y1="100" x2="10"  y2="100"/>
-            <line x1="180" y1="100" x2="190" y2="100"/>
-            <line x1="100" y1="20"  x2="100" y2="8"/>
-            <line x1="57"  y1="43"  x2="50"  y2="36"/>
-            <line x1="143" y1="43"  x2="150" y2="36"/>
+                style="transition:stroke-dashoffset 1.1s cubic-bezier(.4,0,.2,1),stroke .5s"/>
+          <g stroke="#3d3a30" stroke-width="1.2">
+            <line x1="15" y1="100" x2="5" y2="100"/>
+            <line x1="175" y1="100" x2="185" y2="100"/>
+            <line x1="95" y1="20" x2="95" y2="8"/>
+            <line x1="52" y1="42" x2="44" y2="34"/>
+            <line x1="138" y1="42" x2="146" y2="34"/>
           </g>
-          <text x="16"  y="118" fill="#6b6048" font-family="'Share Tech Mono'" font-size="9">0</text>
-          <text x="176" y="118" fill="#6b6048" font-family="'Share Tech Mono'" font-size="9">100</text>
+          <text x="8" y="118" fill="#6a5e48" font-family="'Share Tech Mono'" font-size="8">HEALTHY</text>
+          <text x="148" y="118" fill="#6a5e48" font-family="'Share Tech Mono'" font-size="8">FAULT</text>
         </svg>
-        <div class="risk-score-big">
-          <div class="risk-num" id="risk-num">--</div>
-          <div class="risk-unit">/ 100</div>
+        <div class="score-center">
+          <div class="score-num" id="score-num">--</div>
+          <div class="score-denom">out of 100</div>
         </div>
       </div>
-      <span class="risk-badge" id="risk-badge">AWAITING DATA</span>
+      <span class="badge" id="badge">AWAITING DATA</span>
     </div>
 
-    <!-- mini gauges -->
-    <div class="gauges-grid">
-      <div class="gauge-cell">
-        <div class="gc-label">BATTERY</div>
-        <div class="gc-value" id="g-bat">--%</div>
-        <div class="gc-bar"><div class="gc-fill" id="b-bat" style="width:0%"></div></div>
+    <div class="metric-grid">
+      <div class="metric-cell">
+        <div class="mc-label">Battery</div>
+        <div class="mc-value" id="mv-bat">--%</div>
+        <div class="mc-tag" id="mt-bat">--</div>
+        <div class="bar"><div class="bar-fill" id="bf-bat" style="width:0%"></div></div>
       </div>
-      <div class="gauge-cell">
-        <div class="gc-label">CPU LOAD</div>
-        <div class="gc-value" id="g-cpu">--%</div>
-        <div class="gc-bar"><div class="gc-fill" id="b-cpu" style="width:0%"></div></div>
+      <div class="metric-cell">
+        <div class="mc-label">CPU Load</div>
+        <div class="mc-value" id="mv-cpu">--%</div>
+        <div class="mc-tag" id="mt-cpu">--</div>
+        <div class="bar"><div class="bar-fill" id="bf-cpu" style="width:0%"></div></div>
       </div>
-      <div class="gauge-cell">
-        <div class="gc-label">MEMORY</div>
-        <div class="gc-value" id="g-ram">--%</div>
-        <div class="gc-bar"><div class="gc-fill" id="b-ram" style="width:0%"></div></div>
+      <div class="metric-cell">
+        <div class="mc-label">Memory</div>
+        <div class="mc-value" id="mv-ram">--%</div>
+        <div class="mc-tag" id="mt-ram">--</div>
+        <div class="bar"><div class="bar-fill" id="bf-ram" style="width:0%"></div></div>
       </div>
-      <div class="gauge-cell">
-        <div class="gc-label">VIBRATION</div>
-        <div class="gc-value" id="g-vib">-.---</div>
-        <div class="gc-bar"><div class="gc-fill" id="b-vib" style="width:0%"></div></div>
+      <div class="metric-cell">
+        <div class="mc-label">Vibration</div>
+        <div class="mc-value" id="mv-vib">-.---</div>
+        <div class="mc-tag" id="mt-vib">--</div>
+        <div class="bar"><div class="bar-fill" id="bf-vib" style="width:0%"></div></div>
       </div>
     </div>
 
-    <!-- fault -->
-    <div class="sec-hdr">Fault Classification</div>
+    <div class="sec">Detected Fault</div>
     <div class="fault-block">
       <div class="fault-name" id="fault-name">AWAITING SCAN</div>
-      <div class="fault-conf">Random Forest confidence: <span id="fault-conf">--%</span></div>
+      <div class="fault-sub" id="fault-sub">Run a scan to detect fault type</div>
     </div>
 
-    <!-- mode tabs -->
-    <div class="sec-hdr">Input Mode</div>
+    <div class="sec">Input Mode</div>
     <div class="mode-tabs">
-      <button class="mode-tab active" onclick="setMode('live')">⬤ Live</button>
-      <button class="mode-tab"        onclick="setMode('industrial')">⬡ Industrial</button>
-      <button class="mode-tab"        onclick="setMode('custom')">◧ Custom</button>
+      <button class="mode-tab on" onclick="setMode('live')">⬤ Live</button>
+      <button class="mode-tab"    onclick="setMode('ind')">⬡ Industrial</button>
+      <button class="mode-tab"    onclick="setMode('custom')">◧ Custom</button>
     </div>
 
-    <!-- live panel -->
-    <div class="live-panel active" id="panel-live">
-      <div class="live-row"><span>DEVICE</span>     <span id="lv-plat">detecting…</span></div>
-      <div class="live-row"><span>BATTERY</span>    <span id="lv-bat">detecting…</span></div>
-      <div class="live-row"><span>VIBRATION</span>  <span id="lv-vib">0.000 m/s²</span></div>
-      <div class="live-row"><span>INTERVAL</span>   <span>4 000 ms</span></div>
-      <div id="ios-btn-wrap" style="display:none;margin-top:12px">
-        <button class="scan-btn" style="font-size:13px;letter-spacing:2px;height:auto;padding:10px" onclick="requestIOSMotion()">
-          ▶ GRANT MOTION ACCESS (iOS)
-        </button>
-        <div style="font-family:var(--mono);font-size:9px;color:var(--muted);margin-top:6px;line-height:1.6">
-          iOS blocks accelerometer until<br>user grants permission via button.
-        </div>
+    <div class="live-panel on" id="p-live">
+      <div class="lrow"><span class="lk">DEVICE</span>     <span class="lv" id="lv-dev">detecting…</span></div>
+      <div class="lrow"><span class="lk">BATTERY</span>    <span class="lv" id="lv-bat">detecting…</span></div>
+      <div class="lrow"><span class="lk">VIBRATION</span>  <span class="lv" id="lv-vib">0.000 m/s²</span></div>
+      <div class="lrow"><span class="lk">SCAN EVERY</span> <span class="lv">4 seconds</span></div>
+      <div class="live-ping">STATUS <span class="blink">▌</span> AUTO-SCANNING</div>
+      <div id="ios-wrap">
+        <button class="ios-btn" onclick="reqIOSMotion()">▶ GRANT MOTION ACCESS (iPhone)</button>
+        <div class="ios-note">iPhone blocks accelerometer until<br>you tap the button above.</div>
       </div>
-      <div class="live-ping">STATUS <span>▌</span> SCANNING</div>
     </div>
 
-    <!-- industrial panel -->
-    <div class="input-panel" id="panel-industrial">
-      <div class="field-row">
-        <div class="field"><label>Vibration m/s²</label><input id="i-vib"  type="number" step="0.01" value="0.15" placeholder="0.15"></div>
-        <div class="field"><label>Temperature °C</label><input id="i-temp" type="number" step="1"    value="45"   placeholder="45"></div>
+    <div class="ipanel" id="p-ind">
+      <div class="frow">
+        <div class="field"><label>Vibration m/s²</label><input id="i-vib" type="number" step="0.01" value="0.15"></div>
+        <div class="field"><label>Temperature °C</label><input id="i-tmp" type="number" step="1"    value="45"></div>
       </div>
-      <div class="field-row">
-        <div class="field"><label>Battery / Power %</label><input id="i-bat"  type="number" step="1" value="85"  placeholder="85"></div>
-        <div class="field"><label>CPU / Node Load %</label><input id="i-cpu"  type="number" step="1" value="30"  placeholder="30"></div>
+      <div class="frow">
+        <div class="field"><label>Power / Battery %</label><input id="i-bat" type="number" step="1" value="85"></div>
+        <div class="field"><label>CPU / Node Load %</label><input id="i-cpu" type="number" step="1" value="30"></div>
       </div>
-      <div class="field-row">
-        <div class="field"><label>Memory / RAM %</label><input id="i-ram"  type="number" step="1" value="50"  placeholder="50"></div>
-        <div class="field"><label>Disk / Storage %</label><input id="i-disk" type="number" step="1" value="40"  placeholder="40"></div>
+      <div class="frow">
+        <div class="field"><label>Memory %</label>       <input id="i-ram" type="number" step="1" value="50"></div>
+        <div class="field"><label>Disk / Storage %</label><input id="i-dsk" type="number" step="1" value="40"></div>
       </div>
-      <button class="scan-btn" onclick="sendIndustrial()">RUN ANALYSIS</button>
+      <button class="go-btn" onclick="sendInd()">RUN ANALYSIS</button>
     </div>
 
-    <!-- custom panel -->
-    <div class="input-panel" id="panel-custom">
-      <div class="field-row">
-        <div class="field"><label>Vibration</label><input id="c-vib"  type="number" step="0.01" value="0.5"></div>
-        <div class="field"><label>Temperature</label><input id="c-temp" type="number" step="1"    value="70"></div>
+    <div class="ipanel" id="p-custom">
+      <div class="frow">
+        <div class="field"><label>Vibration m/s²</label><input id="c-vib" type="number" step="0.01" value="0.5"></div>
+        <div class="field"><label>Temperature °C</label><input id="c-tmp" type="number" step="1"    value="70"></div>
       </div>
-      <div class="field-row">
-        <div class="field"><label>Battery %</label><input id="c-bat"  type="number" step="1" value="20"></div>
-        <div class="field"><label>CPU %</label><input id="c-cpu"  type="number" step="1" value="90"></div>
+      <div class="frow">
+        <div class="field"><label>Battery %</label><input id="c-bat" type="number" step="1" value="20"></div>
+        <div class="field"><label>CPU %</label>    <input id="c-cpu" type="number" step="1" value="90"></div>
       </div>
-      <div class="field-row">
-        <div class="field"><label>Memory %</label><input id="c-ram"  type="number" step="1" value="88"></div>
-        <div class="field"><label>Disk %</label><input id="c-disk" type="number" step="1" value="95"></div>
+      <div class="frow">
+        <div class="field"><label>Memory %</label> <input id="c-ram" type="number" step="1" value="88"></div>
+        <div class="field"><label>Disk %</label>   <input id="c-dsk" type="number" step="1" value="95"></div>
       </div>
-      <button class="scan-btn" onclick="sendCustom()">RUN ANALYSIS</button>
+      <button class="go-btn" onclick="sendCustom()">RUN ANALYSIS</button>
     </div>
 
-  </div><!-- /left-panel -->
+  </div><!-- /left-col -->
 
-  <!-- RIGHT PANEL -->
-  <div class="right-panel">
-
+  <div class="right-col">
     <div class="dev-tabs" id="dev-tabs"></div>
-
-    <div id="main-content">
-      <div class="empty-state" id="empty">
-        <div class="big-label">IDLE</div>
-        <p>NO PROBE DATA RECEIVED<br>SELECT AN INPUT MODE AND RUN A SCAN</p>
+    <div id="main-area">
+      <div class="empty" id="empty-state">
+        <div class="big">IDLE</div>
+        <p>NO PROBE DATA RECEIVED<br>SELECT A MODE AND RUN A SCAN</p>
       </div>
     </div>
-
   </div>
 
-</div><!-- /shell -->
+</div>
 
 <script>
-// ── STATE ──────────────────────────────────────────────────────
-let selectedDev = null;
-let currentMode = 'live';
-let liveData    = {};
-let liveInterval;
-let motionEnabled = false;
-let lastVib = 0;
+let selDev  = null, curMode = 'live', liveInt;
+let lastVib = 0, batLevel = null, batOK = false;
 
-// ── CLOCK ─────────────────────────────────────────────────────
-function tickClock() {
+function tick() {
   const n = new Date();
   document.getElementById('clock').textContent = n.toLocaleTimeString('en-GB');
-  document.getElementById('date-line').textContent =
-    n.toLocaleDateString('en-GB', {day:'2-digit', month:'short', year:'numeric'}).toUpperCase();
+  document.getElementById('dline').textContent = n.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'}).toUpperCase();
 }
-setInterval(tickClock, 1000);
-tickClock();
+setInterval(tick,1000); tick();
 
-// ── MODE ──────────────────────────────────────────────────────
-function setMode(m) {
-  currentMode = m;
-  document.querySelectorAll('.mode-tab').forEach((t,i) => {
-    t.classList.toggle('active', ['live','industrial','custom'][i] === m);
-  });
-  ['live','industrial','custom'].forEach(id => {
-    const lp = document.getElementById('panel-' + id);
-    const ip = document.getElementById('panel-' + id);
-    if (lp) lp.classList.toggle('active', id === m);
-  });
-  // Re-show correct panel
-  document.getElementById('panel-live').classList.toggle('active', m === 'live');
-  document.getElementById('panel-industrial').classList.toggle('active', m === 'industrial');
-  document.getElementById('panel-custom').classList.toggle('active', m === 'custom');
-
-  if (m === 'live') startLiveSensors();
-  else clearInterval(liveInterval);
-}
-
-// ── DEVICE DETECTION ─────────────────────────────────────────
-function detectDevice() {
+function devName() {
   const ua = navigator.userAgent;
-  if (/iPhone/i.test(ua))               return 'iPhone';
-  if (/iPad/i.test(ua))                 return 'iPad';
-  if (/Android/i.test(ua))              return 'Android';
-  if (/Macintosh|Mac OS X/i.test(ua))   return 'macOS';
-  if (/Windows/i.test(ua))              return 'Windows';
-  if (/Linux/i.test(ua))                return 'Linux';
+  if (/iPhone/i.test(ua))  return 'iPhone';
+  if (/iPad/i.test(ua))    return 'iPad';
+  if (/Android/i.test(ua)) return 'Android';
+  if (/Mac OS X/i.test(ua) && !/iPhone|iPad/i.test(ua)) return 'macOS';
+  if (/Windows/i.test(ua)) return 'Windows';
+  if (/Linux/i.test(ua))   return 'Linux';
   return 'Unknown';
 }
+function isIOS() { return /iPhone|iPad|iPod/i.test(navigator.userAgent); }
 
-function isIOS() {
-  return /iPhone|iPad|iPod/i.test(navigator.userAgent);
-}
-
-// ── SENSORS ───────────────────────────────────────────────────
-let batteryLevel = null;   // null = not yet known
-let batteryAvailable = false;
-
-async function initBattery() {
-  if (isIOS()) {
-    // iOS Safari blocks Battery API entirely — mark as unavailable
-    batteryAvailable = false;
-    batteryLevel = null;
-    return;
-  }
+async function initBat() {
+  if (isIOS()) { batOK = false; return; }
   try {
     if (navigator.getBattery) {
       const b = await navigator.getBattery();
-      batteryLevel = Math.round(b.level * 100);
-      batteryAvailable = true;
-      // Keep updating if it changes
-      b.addEventListener('levelchange', () => {
-        batteryLevel = Math.round(b.level * 100);
-      });
+      batLevel = Math.round(b.level * 100); batOK = true;
+      b.addEventListener('levelchange', () => { batLevel = Math.round(b.level * 100); });
     }
-  } catch(e) {
-    batteryAvailable = false;
-    batteryLevel = null;
-  }
+  } catch(e) { batOK = false; }
 }
 
-function enableMotion() {
-  if (isIOS()) {
-    // iOS needs explicit user gesture — handled by the Grant Access button
-    return;
-  }
+function initMotion() {
+  if (isIOS()) return;
   if (typeof DeviceMotionEvent !== 'undefined' && DeviceMotionEvent.requestPermission) {
-    DeviceMotionEvent.requestPermission().then(s => {
-      if (s === 'granted') listenMotion();
-    }).catch(() => {});
-  } else {
-    listenMotion();
-  }
+    DeviceMotionEvent.requestPermission().then(s => { if (s==='granted') listenMotion(); }).catch(()=>{});
+  } else { listenMotion(); }
 }
-
 function listenMotion() {
-  motionEnabled = true;
   window.addEventListener('devicemotion', e => {
     const a = e.acceleration || e.accelerationIncludingGravity;
-    if (a && (a.x !== null)) {
-      lastVib = Math.round(((Math.abs(a.x||0) + Math.abs(a.y||0) + Math.abs(a.z||0)) / 30) * 1000) / 1000;
-    }
+    if (a && a.x !== null)
+      lastVib = Math.round(((Math.abs(a.x||0)+Math.abs(a.y||0)+Math.abs(a.z||0))/30)*1000)/1000;
   });
 }
-
-function startLiveSensors() {
-  enableMotion();
-  clearInterval(liveInterval);
-  doLiveScan();
-  liveInterval = setInterval(doLiveScan, 4000);
-}
-
-async function doLiveScan() {
-  const devName = detectDevice();
-
-  // Battery display
-  let batDisplay = batteryAvailable && batteryLevel !== null ? batteryLevel + '%' : (isIOS() ? 'N/A (iOS)' : 'detecting…');
-  // Use 85 as neutral fallback for ML only when unavailable
-  let batForML   = (batteryAvailable && batteryLevel !== null) ? batteryLevel : 85;
-
-  document.getElementById('lv-bat').textContent  = batDisplay;
-  document.getElementById('lv-vib').textContent  = lastVib.toFixed(3) + ' m/s²';
-  document.getElementById('lv-plat').textContent = devName;
-
-  // Dynamic memory estimate via performance API
-  let memEst = 50;
-  if (navigator.deviceMemory) {
-    // deviceMemory is in GB (1,2,4,8), estimate % as rough heuristic
-    memEst = Math.max(20, Math.min(85, Math.round(100 - navigator.deviceMemory * 8)));
-  }
-
-  await sendToServer({
-    device_type: devName,
-    battery:     batForML,
-    vibration:   lastVib,
-    // CPU load can't be read from browser — use a stable estimate
-    cpu_load:    Math.round(20 + lastVib * 40),
-    memory:      memEst,
-    temperature: Math.round(32 + (100 - batForML) * 0.25 + lastVib * 8),
-    disk_usage:  50,
-    battery_available: batteryAvailable,
-  });
-}
-
-async function sendIndustrial() {
-  await sendToServer({
-    device_type:  'Industrial',
-    vibration:    parseFloat(document.getElementById('i-vib').value)  || 0.15,
-    temperature:  parseFloat(document.getElementById('i-temp').value) || 45,
-    battery:      parseFloat(document.getElementById('i-bat').value)  || 85,
-    cpu_load:     parseFloat(document.getElementById('i-cpu').value)  || 30,
-    memory:       parseFloat(document.getElementById('i-ram').value)  || 50,
-    disk_usage:   parseFloat(document.getElementById('i-disk').value) || 40,
-  });
-}
-
-async function sendCustom() {
-  await sendToServer({
-    device_type:  'Custom',
-    vibration:    parseFloat(document.getElementById('c-vib').value)  || 0.5,
-    temperature:  parseFloat(document.getElementById('c-temp').value) || 70,
-    battery:      parseFloat(document.getElementById('c-bat').value)  || 20,
-    cpu_load:     parseFloat(document.getElementById('c-cpu').value)  || 90,
-    memory:       parseFloat(document.getElementById('c-ram').value)  || 88,
-    disk_usage:   parseFloat(document.getElementById('c-disk').value) || 95,
-  });
-}
-
-async function sendToServer(payload) {
-  try {
-    const r = await fetch('/predict', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(payload)
+function reqIOSMotion() {
+  if (DeviceMotionEvent && DeviceMotionEvent.requestPermission) {
+    DeviceMotionEvent.requestPermission().then(s => {
+      if (s==='granted') { listenMotion(); document.getElementById('ios-wrap').style.display='none'; }
     });
+  }
+}
+
+function startLive() { initMotion(); clearInterval(liveInt); doScan(); liveInt = setInterval(doScan, 4000); }
+
+async function doScan() {
+  const dn  = devName();
+  const bat = (batOK && batLevel !== null) ? batLevel : 85;
+  const batD= (batOK && batLevel !== null) ? bat+'%' : (isIOS()?'N/A (iOS)':'detecting…');
+  let memEst = 50;
+  if (navigator.deviceMemory) memEst = Math.max(20, Math.min(85, Math.round(100 - navigator.deviceMemory * 8)));
+
+  document.getElementById('lv-dev').textContent = dn;
+  document.getElementById('lv-bat').textContent = batD;
+  document.getElementById('lv-vib').textContent = lastVib.toFixed(3) + ' m/s²';
+
+  await send({
+    device_type: dn, battery: bat, vibration: lastVib,
+    cpu_load: Math.round(18 + lastVib * 35), memory: memEst,
+    temperature: Math.round(30 + (100-bat)*0.22 + lastVib*7), disk_usage: 50,
+  });
+}
+
+async function sendInd() {
+  await send({ device_type:'Industrial',
+    vibration: +document.getElementById('i-vib').value||0.15,
+    temperature:+document.getElementById('i-tmp').value||45,
+    battery:   +document.getElementById('i-bat').value||85,
+    cpu_load:  +document.getElementById('i-cpu').value||30,
+    memory:    +document.getElementById('i-ram').value||50,
+    disk_usage:+document.getElementById('i-dsk').value||40,
+  });
+}
+async function sendCustom() {
+  await send({ device_type:'Custom',
+    vibration: +document.getElementById('c-vib').value||0.5,
+    temperature:+document.getElementById('c-tmp').value||70,
+    battery:   +document.getElementById('c-bat').value||20,
+    cpu_load:  +document.getElementById('c-cpu').value||90,
+    memory:    +document.getElementById('c-ram').value||88,
+    disk_usage:+document.getElementById('c-dsk').value||95,
+  });
+}
+
+async function send(payload) {
+  try {
+    const r = await fetch('/predict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     const d = await r.json();
-    updateDashboard(payload.device_type, d);
-    refreshData();
-  } catch(e) {
-    document.getElementById('conn-label').textContent = 'ERROR';
-  }
+    applyGauges(d);
+    await refresh();
+  } catch(e) { document.getElementById('conn-lbl').textContent='ERROR'; }
 }
 
-// ── RENDER ────────────────────────────────────────────────────
-function updateDashboard(devKey, d) {
-  // Arc gauge
-  const pct   = Math.min(100, d.anomaly_score || 0);
-  const total = 251.2;
-  const fill  = total - (pct / 100) * total;
-  const arc   = document.getElementById('arc-fill');
-  arc.style.strokeDashoffset = fill;
-  arc.style.stroke = pct >= 70 ? '#d63c2a' : pct >= 40 ? '#c47a10' : '#4a8c5c';
+function applyGauges(d) {
+  const sc = d.health_score || 0;
 
-  // Number
-  document.getElementById('risk-num').textContent = Math.round(pct);
+  // arc
+  document.getElementById('arc').style.strokeDashoffset = 251.2 - (sc/100)*251.2;
+  document.getElementById('arc').style.stroke = sc>=65?'#e04030':sc>=35?'#f0a830':'#5ab870';
+  const sn = document.getElementById('score-num');
+  sn.textContent = sc;
+  sn.style.color = sc>=65?'#ff9080':sc>=35?'#f0a830':'#a0f0b8';
 
-  // Badge + state class
-  const state = pct >= 70 ? 'critical' : pct >= 40 ? 'warning' : 'nominal';
-  const badge = pct >= 70 ? 'CRITICAL' : pct >= 40 ? 'WARNING' : 'NOMINAL';
-  const rs    = document.getElementById('risk-state');
-  rs.className = state;
-  document.getElementById('risk-badge').textContent = badge;
+  const b = document.getElementById('badge');
+  b.textContent = sc>=65?'CRITICAL — HALT':sc>=35?'WARNING':'NOMINAL';
+  b.className   = 'badge '+(sc>=65?'critical':sc>=35?'':'nominal');
 
-  // Mini gauges
-  setGauge('bat',  d.battery,    '%');
-  setGauge('cpu',  d.cpu_load,   '%');
-  setGauge('ram',  d.memory,     '%');
-  setVibGauge(d.vibration);
+  // tiles
+  tile('bat', d.battery+'%',
+    d.battery<20?'bad':d.battery<40?'warn':'good',
+    d.battery<20?'CRITICAL — charge now':d.battery<40?'LOW — drain risk':'HEALTHY',
+    d.battery, d.battery<20?'#e04030':d.battery<40?'#e8c040':'#5ab870');
 
-  // Fault
-  document.getElementById('fault-name').textContent = (d.fault || 'NORMAL').replace(/_/g,' ');
-  document.getElementById('fault-conf').textContent = (d.fault_confidence || 0).toFixed(1) + '%';
+  tile('cpu', Math.round(d.cpu_load)+'%',
+    d.cpu_load>90?'bad':d.cpu_load>75?'warn':'good',
+    d.cpu_load>90?'SATURATED':d.cpu_load>75?'ELEVATED':'NORMAL',
+    d.cpu_load, d.cpu_load>90?'#e04030':d.cpu_load>75?'#e8c040':'#5ab870');
+
+  tile('ram', Math.round(d.memory)+'%',
+    d.memory>90?'bad':d.memory>75?'warn':'good',
+    d.memory>90?'NEARLY FULL':d.memory>75?'HIGH USAGE':'NORMAL',
+    d.memory, d.memory>90?'#e04030':d.memory>75?'#e8c040':'#5ab870');
+
+  const vibPct = Math.min(100,(d.vibration/2)*100);
+  tile('vib', d.vibration.toFixed(3),
+    d.vibration>0.8?'bad':d.vibration>0.45?'warn':'good',
+    d.vib_health||'NORMAL', vibPct,
+    d.vibration>0.8?'#e04030':d.vibration>0.45?'#e8c040':'#5ab870');
+
+  document.getElementById('fault-name').textContent = d.fault||'NORMAL';
+  document.getElementById('fault-sub').textContent  =
+    `IF anomaly component: ${d.if_component??'--'} / 100  ·  Rule penalty: +${d.penalty??0}`;
 }
 
-function setGauge(id, val, unit) {
-  // Battery special handling — on iOS it's unavailable
-  if (id === 'bat' && isIOS() && !batteryAvailable) {
-    document.getElementById('g-bat').textContent = 'N/A';
-    document.getElementById('b-bat').style.width = '0%';
-    return;
-  }
-  document.getElementById('g-' + id).textContent = Math.round(val) + unit;
-  document.getElementById('b-' + id).style.width  = Math.min(100, val) + '%';
-  const fill = document.getElementById('b-' + id);
-  fill.style.background = val > 90 ? '#d63c2a' : val > 70 ? '#c47a10' : '#4a8c5c';
-  if (id === 'bat') fill.style.background = val < 20 ? '#d63c2a' : val < 40 ? '#c47a10' : '#4a8c5c';
+function tile(id, val, cls, tag, pct, color) {
+  document.getElementById('mv-'+id).textContent = val;
+  document.getElementById('mv-'+id).className   = 'mc-value '+cls;
+  document.getElementById('mt-'+id).textContent = tag;
+  const bf = document.getElementById('bf-'+id);
+  bf.style.width = Math.min(100,pct)+'%';
+  bf.style.background = color;
 }
 
-function setVibGauge(v) {
-  document.getElementById('g-vib').textContent = (v || 0).toFixed(3);
-  const pct = Math.min(100, (v / 2) * 100);
-  document.getElementById('b-vib').style.width      = pct + '%';
-  document.getElementById('b-vib').style.background = v > 0.8 ? '#d63c2a' : v > 0.5 ? '#c47a10' : '#4a8c5c';
-}
-
-async function refreshData() {
+async function refresh() {
   try {
     const r = await fetch('/data');
     const d = await r.json();
-    const devs = d.all_devices || {};
+    const devs  = d.all_devices||{};
     const names = Object.keys(devs);
 
     document.getElementById('dev-count').textContent = names.length;
-    document.getElementById('conn-label').textContent = 'ONLINE';
+    document.getElementById('conn-lbl').textContent  = 'ONLINE';
 
-    // Device tabs
-    const tabs = names.map(n =>
-      `<button class="dev-tab ${n===selectedDev?'active':''}" onclick="selectDev('${n}')">${n.toUpperCase()}</button>`
+    document.getElementById('dev-tabs').innerHTML = names.map(n =>
+      `<button class="dev-tab ${n===selDev?'on':''}" onclick="selClick('${n}')">${n.toUpperCase()}</button>`
     ).join('');
-    document.getElementById('dev-tabs').innerHTML = tabs;
 
-    if (!names.length) { document.getElementById('empty').style.display = 'flex'; return; }
-    document.getElementById('empty').style.display = 'none';
+    if (!names.length) { document.getElementById('empty-state').style.display='flex'; return; }
+    document.getElementById('empty-state').style.display='none';
 
-    // If selectedDev not in data yet (page just loaded), pick it or fall back to last
-    if (!devs[selectedDev]) {
-      selectedDev = names.includes(selectedDev) ? selectedDev : names[names.length-1];
-    }
-    const current = devs[selectedDev] || {};
+    if (!devs[selDev]) selDev = names.includes(devName())?devName():names[names.length-1];
+    const cur  = devs[selDev]||{};
+    const hist = ((d.per_dev_hist||{})[selDev])||[];
 
-    renderRightPanel(current, d.history || []);
+    applyGauges(cur);
+    renderRight(cur, hist);
   } catch(e) {}
 }
 
-function selectDev(name) {
-  selectedDev = name;
-  refreshData();
-}
+function selClick(n) { selDev=n; refresh(); }
 
-function renderRightPanel(d, hist) {
-  const recs = (d.recommendations || []).map((r, i) =>
-    `<li><span class="rec-num">${String(i+1).padStart(2,'0')}.</span>${r}</li>`
+function renderRight(d, hist) {
+  const recs = (d.recommendations||[]).map((r,i) =>
+    `<li><span class="rnum">${String(i+1).padStart(2,'0')}.</span>${r}</li>`
   ).join('');
 
-  const sparkBars = hist.map(v => {
-    const h   = Math.max(4, v);
-    const col = v >= 70 ? '#d63c2a' : v >= 40 ? '#c47a10' : '#4a8c5c';
-    return `<div class="spark-col" style="height:${h}%;background:${col}"></div>`;
-  }).join('');
+  const mkSpark = (vals, cfn) => vals.length
+    ? vals.map(v => `<div class="spark-bar" style="height:${Math.max(4,Math.min(100,v))}%;background:${cfn(v)}"></div>`).join('')
+    : '<span style="color:var(--muted);font-family:var(--mono);font-size:9px;padding:4px">COLLECTING DATA…</span>';
 
-  // CPU mini chart (simulated from history)
-  const cpuBars = hist.map((v, i) => {
-    const c = Math.max(4, Math.min(100, 10 + v * 0.5 + (i % 3) * 5));
-    return `<div class="spark-col" style="height:${c}%;background:#e8a020"></div>`;
-  }).join('');
+  const scoreS = mkSpark(hist, v => v>=65?'#e04030':v>=35?'#f0a830':'#5ab870');
+  const cpuS   = mkSpark(hist.map(v=>Math.min(100,10+v*0.45)), ()=>'#f0a830');
+  const batVals = hist.map((_,i)=>Math.max(4,Math.min(100,(d.battery||80)-i*0.5)));
+  const batS   = mkSpark(batVals, v=>v<20?'#e04030':v<40?'#e8c040':'#5ab870');
 
-  // Battery trend
-  const batBars = hist.map((v, i) => {
-    const b = Math.max(4, Math.min(100, (d.battery || 80) - i * 0.5));
-    const col = b < 20 ? '#d63c2a' : b < 40 ? '#c47a10' : '#4a8c5c';
-    return `<div class="spark-col" style="height:${b}%;background:${col}"></div>`;
-  }).join('');
+  const tv = cl => `tag ${cl}`;
+  const vt = d.vibration>0.8?'tag-c':d.vibration>0.45?'tag-w':'tag-n';
+  const tt = d.thermal==='OVERHEATING'?'tag-c':(d.thermal==='HOT'||d.thermal==='WARM')?'tag-w':'tag-n';
+  const bt = d.bat_trend==='DRAINING'?'tag-w':d.bat_trend==='RISING'?'tag-n':'tag-n';
 
-  const mc = document.getElementById('main-content');
-  mc.innerHTML = `
-    <div class="rec-strip">
-      <div class="rec-title">ML RECOMMENDATIONS — ${(d.status || 'NO STATUS')}</div>
-      <ul class="rec-list">${recs}</ul>
+  // score breakdown bar
+  const ifPct   = Math.round((d.if_component||0) * 0.6);
+  const rulePct = Math.round(((d.penalty||0)/60*100) * 0.4);
+
+  document.getElementById('main-area').innerHTML = `
+    <div class="explainer">
+      <div class="exp-title">How This Score Was Calculated</div>
+      <div class="exp-row">
+        <span class="exp-lbl">IF Anomaly (60%)</span>
+        <div class="exp-bar-wrap"><div class="exp-bar" style="width:${Math.min(100,d.if_component||0)}%;background:var(--amber)"></div></div>
+        <span class="exp-val">${d.if_component??'--'}/100</span>
+      </div>
+      <div class="exp-row">
+        <span class="exp-lbl">Rule Penalty (40%)</span>
+        <div class="exp-bar-wrap"><div class="exp-bar" style="width:${Math.min(100,(d.penalty||0)/60*100)}%;background:var(--red)"></div></div>
+        <span class="exp-val">+${d.penalty??0}</span>
+      </div>
+      <div class="exp-row">
+        <span class="exp-lbl">Final Score</span>
+        <div class="exp-bar-wrap"><div class="exp-bar" style="width:${d.health_score||0}%;background:${(d.health_score||0)>=65?'#e04030':(d.health_score||0)>=35?'#f0a830':'#5ab870'}"></div></div>
+        <span class="exp-val">${d.health_score??'--'}/100</span>
+      </div>
+    </div>
+    <div class="recs-block">
+      <div class="recs-title">AI Recommendations — ${d.status||''}</div>
+      <ul class="recs-list">${recs}</ul>
     </div>
     <div class="charts-row">
       <div class="chart-block">
-        <div class="chart-title">Anomaly Score History</div>
-        <div class="spark-area">${sparkBars || '<span style="color:var(--muted);font-size:10px">NO HISTORY</span>'}</div>
+        <div class="chart-title">Health Score History</div>
+        <div class="chart-sub">Last ${hist.length} scans · ${selDev||''}</div>
+        <div class="spark">${scoreS}</div>
       </div>
       <div class="chart-block">
-        <div class="chart-title">CPU Load Correlation</div>
-        <div class="spark-area">${cpuBars || '<span style="color:var(--muted);font-size:10px">NO HISTORY</span>'}</div>
+        <div class="chart-title">CPU Load Trend</div>
+        <div class="chart-sub">Correlated with anomaly score</div>
+        <div class="spark">${cpuS}</div>
       </div>
       <div class="chart-block">
-        <div class="chart-title">Battery Life Projection</div>
-        <div class="spark-area">${batBars || '<span style="color:var(--muted);font-size:10px">NO HISTORY</span>'}</div>
+        <div class="chart-title">Battery Projection</div>
+        <div class="chart-sub">${d.rul_hours===999?'Stable / Charging':d.rul_hours+'h est. remaining'}</div>
+        <div class="spark">${batS}</div>
       </div>
     </div>
     <div class="meta-row">
-      <div class="meta-cell"><div class="meta-k">Z-SCORE</div><div class="meta-v">${d.z_score ?? '--'}</div></div>
-      <div class="meta-cell"><div class="meta-k">TREND</div><div class="meta-v">${d.trend ?? '--'}</div></div>
-      <div class="meta-cell"><div class="meta-k">RUL ESTIMATE</div><div class="meta-v">${d.rul_hours === 999 ? '∞' : (d.rul_hours ?? '--')}h</div></div>
-      <div class="meta-cell"><div class="meta-k">TEMPERATURE</div><div class="meta-v">${d.temperature ?? '--'}°C</div></div>
-      <div class="meta-cell"><div class="meta-k">DISK USAGE</div><div class="meta-v">${d.disk_usage ?? '--'}%</div></div>
+      <div class="mcell"><div class="mk">Vibration State</div><div class="mv"><span class="tag ${vt}">${d.vib_health||'--'}</span></div></div>
+      <div class="mcell"><div class="mk">Thermal State</div><div class="mv"><span class="tag ${tt}">${d.thermal||'--'}</span></div></div>
+      <div class="mcell"><div class="mk">Battery Trend</div><div class="mv"><span class="tag ${bt}">${d.bat_trend||'STABLE'}</span></div></div>
+      <div class="mcell"><div class="mk">Battery Life Est.</div><div class="mv">${d.rul_hours===999?'∞ / Charging':d.rul_hours+'h'}</div></div>
+      <div class="mcell"><div class="mk">Temperature</div><div class="mv">${d.temperature??'--'}°C</div></div>
     </div>`;
 }
 
-// ── iOS MOTION REQUEST ────────────────────────────────────────
-function requestIOSMotion() {
-  if (typeof DeviceMotionEvent !== 'undefined' && DeviceMotionEvent.requestPermission) {
-    DeviceMotionEvent.requestPermission().then(s => {
-      if (s === 'granted') {
-        listenMotion();
-        document.getElementById('ios-btn-wrap').style.display = 'none';
-      }
-    }).catch(e => console.warn('Motion permission denied', e));
-  }
+function setMode(m) {
+  curMode = m;
+  ['live','ind','custom'].forEach((id,i)=>{
+    document.querySelectorAll('.mode-tab')[i].classList.toggle('on',id===m);
+    const lp = document.getElementById('p-'+id);
+    if (lp) lp.classList.toggle('on',id===m);
+  });
+  ['ipanel'].forEach(()=>{});
+  document.getElementById('p-live').classList.toggle('on',m==='live');
+  document.getElementById('p-ind').classList.toggle('on',m==='ind');
+  document.getElementById('p-custom').classList.toggle('on',m==='custom');
+  if (m==='live') startLive(); else clearInterval(liveInt);
 }
 
-// ── BOOT ──────────────────────────────────────────────────────
-// Default selectedDev to the device currently opening the page
-selectedDev = detectDevice();
-
-// Show iOS grant button if needed
-if (isIOS()) {
-  document.getElementById('ios-btn-wrap').style.display = 'block';
-}
-
-// Init battery API before first scan
-initBattery().then(() => {
-  startLiveSensors();
-});
-setInterval(refreshData, 4000);
-refreshData();
+// boot
+selDev = devName();
+if (isIOS()) document.getElementById('ios-wrap').style.display='block';
+initBat().then(()=>startLive());
+setInterval(refresh, 4000);
+refresh();
 </script>
 </body>
 </html>"""
