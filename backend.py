@@ -14,7 +14,7 @@ trend_model = LinearRegression()
 baseline = np.random.normal(0.08, 0.02, (200, 1))
 model.fit(baseline)
 
-# ---------------- DATA ----------------
+# ---------------- DATA STORAGE ----------------
 history = []
 battery_history = []
 time_history = []
@@ -28,21 +28,29 @@ last_data = {
     "fault": "NORMAL",
     "battery": -1,
     "battery_drain": "N/A",
+    "cpu": 0,
+    "memory": 0,
+    "device": "unknown",
     "risk": "NOMINAL"
 }
 
 
+# ---------------- HOME ----------------
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return await monitor()
 
 
+# ---------------- PREDICT ----------------
 @app.post("/predict")
 async def predict(data: dict):
     global history, battery_history, time_history, last_data
 
     vib = float(data.get("vibration", 0))
     battery = int(data.get("battery", -1))
+    cpu = float(data.get("cpu", 0))
+    memory = float(data.get("memory", 0))
+    device = data.get("device", "unknown")
 
     history.append(vib)
     if len(history) > 50:
@@ -119,6 +127,7 @@ async def predict(data: dict):
     else:
         risk = "NOMINAL"
 
+    # ---------- FINAL OUTPUT ----------
     last_data = {
         "score": health,
         "vibration": round(vib, 3),
@@ -128,17 +137,22 @@ async def predict(data: dict):
         "fault": fault,
         "battery": battery,
         "battery_drain": battery_drain,
+        "cpu": cpu,
+        "memory": memory,
+        "device": device,
         "risk": risk
     }
 
     return last_data
 
 
+# ---------------- DATA FETCH ----------------
 @app.get("/data")
 async def get_data():
     return last_data
 
 
+# ---------------- DASHBOARD UI ----------------
 @app.get("/monitor", response_class=HTMLResponse)
 async def monitor():
     return """
@@ -146,8 +160,6 @@ async def monitor():
 <html>
 <head>
 <title>AI FUTURE DASHBOARD</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
 <style>
 body {
     margin:0;
@@ -195,6 +207,8 @@ button {
 <div class="card"><h2 id="fault">--</h2>Fault</div>
 <div class="card"><h2 id="battery">--</h2>Battery</div>
 <div class="card"><h2 id="drain">--</h2>Battery Life</div>
+<div class="card"><h2 id="cpu">--</h2>CPU</div>
+<div class="card"><h2 id="memory">--</h2>Memory</div>
 <div class="card"><h2 id="risk">--</h2>Status</div>
 </div>
 
@@ -204,7 +218,7 @@ button {
 <script>
 let batteryLevel = -1;
 
-// BATTERY API
+// Try battery API
 if (navigator.getBattery) {
     navigator.getBattery().then(function(battery) {
         function updateBattery() {
@@ -212,14 +226,14 @@ if (navigator.getBattery) {
         }
         updateBattery();
         battery.addEventListener('levelchange', updateBattery);
-    });
+    }).catch(() => { batteryLevel = -1; });
 }
 
-// SENSOR START
 function startSensors() {
     if (typeof DeviceMotionEvent.requestPermission === 'function') {
-        DeviceMotionEvent.requestPermission()
-        .then(p => { if(p === 'granted') activate(); });
+        DeviceMotionEvent.requestPermission().then(p => {
+            if(p === 'granted') activate();
+        });
     } else {
         activate();
     }
@@ -237,13 +251,13 @@ function activate() {
             headers:{'Content-Type':'application/json'},
             body: JSON.stringify({
                 vibration: vib,
-                battery: batteryLevel
+                battery: batteryLevel,
+                device: "phone"
             })
         });
     });
 }
 
-// UI UPDATE
 async function update(){
     let r = await fetch('/data');
     let d = await r.json();
@@ -256,6 +270,8 @@ async function update(){
     fault.innerText = d.fault;
     battery.innerText = d.battery >= 0 ? d.battery + "%" : "N/A";
     drain.innerText = d.battery_drain;
+    cpu.innerText = d.cpu + "%";
+    memory.innerText = d.memory + "%";
     risk.innerText = d.risk;
 }
 
