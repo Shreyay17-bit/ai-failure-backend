@@ -805,10 +805,18 @@ header {
 
     <!-- live panel -->
     <div class="live-panel active" id="panel-live">
+      <div class="live-row"><span>DEVICE</span>     <span id="lv-plat">detecting…</span></div>
       <div class="live-row"><span>BATTERY</span>    <span id="lv-bat">detecting…</span></div>
-      <div class="live-row"><span>ACCELEROMETER</span><span id="lv-vib">detecting…</span></div>
-      <div class="live-row"><span>PLATFORM</span>   <span id="lv-plat">detecting…</span></div>
+      <div class="live-row"><span>VIBRATION</span>  <span id="lv-vib">0.000 m/s²</span></div>
       <div class="live-row"><span>INTERVAL</span>   <span>4 000 ms</span></div>
+      <div id="ios-btn-wrap" style="display:none;margin-top:12px">
+        <button class="scan-btn" style="font-size:13px;letter-spacing:2px;height:auto;padding:10px" onclick="requestIOSMotion()">
+          ▶ GRANT MOTION ACCESS (iOS)
+        </button>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--muted);margin-top:6px;line-height:1.6">
+          iOS blocks accelerometer until<br>user grants permission via button.
+        </div>
+      </div>
       <div class="live-ping">STATUS <span>▌</span> SCANNING</div>
     </div>
 
@@ -903,18 +911,54 @@ function setMode(m) {
   else clearInterval(liveInterval);
 }
 
+// ── DEVICE DETECTION ─────────────────────────────────────────
+function detectDevice() {
+  const ua = navigator.userAgent;
+  if (/iPhone/i.test(ua))               return 'iPhone';
+  if (/iPad/i.test(ua))                 return 'iPad';
+  if (/Android/i.test(ua))              return 'Android';
+  if (/Macintosh|Mac OS X/i.test(ua))   return 'macOS';
+  if (/Windows/i.test(ua))              return 'Windows';
+  if (/Linux/i.test(ua))                return 'Linux';
+  return 'Unknown';
+}
+
+function isIOS() {
+  return /iPhone|iPad|iPod/i.test(navigator.userAgent);
+}
+
 // ── SENSORS ───────────────────────────────────────────────────
-async function getBattery() {
+let batteryLevel = null;   // null = not yet known
+let batteryAvailable = false;
+
+async function initBattery() {
+  if (isIOS()) {
+    // iOS Safari blocks Battery API entirely — mark as unavailable
+    batteryAvailable = false;
+    batteryLevel = null;
+    return;
+  }
   try {
     if (navigator.getBattery) {
       const b = await navigator.getBattery();
-      return Math.round(b.level * 100);
+      batteryLevel = Math.round(b.level * 100);
+      batteryAvailable = true;
+      // Keep updating if it changes
+      b.addEventListener('levelchange', () => {
+        batteryLevel = Math.round(b.level * 100);
+      });
     }
-  } catch(e) {}
-  return 85;
+  } catch(e) {
+    batteryAvailable = false;
+    batteryLevel = null;
+  }
 }
 
 function enableMotion() {
+  if (isIOS()) {
+    // iOS needs explicit user gesture — handled by the Grant Access button
+    return;
+  }
   if (typeof DeviceMotionEvent !== 'undefined' && DeviceMotionEvent.requestPermission) {
     DeviceMotionEvent.requestPermission().then(s => {
       if (s === 'granted') listenMotion();
@@ -928,7 +972,9 @@ function listenMotion() {
   motionEnabled = true;
   window.addEventListener('devicemotion', e => {
     const a = e.acceleration || e.accelerationIncludingGravity;
-    if (a) lastVib = Math.round(((Math.abs(a.x||0) + Math.abs(a.y||0) + Math.abs(a.z||0)) / 30) * 1000) / 1000;
+    if (a && (a.x !== null)) {
+      lastVib = Math.round(((Math.abs(a.x||0) + Math.abs(a.y||0) + Math.abs(a.z||0)) / 30) * 1000) / 1000;
+    }
   });
 }
 
@@ -940,21 +986,34 @@ function startLiveSensors() {
 }
 
 async function doLiveScan() {
-  const bat  = await getBattery();
-  const plat = navigator.platform || navigator.userAgentData?.platform || navigator.userAgent.includes('Android') ? 'Android' : 'Desktop';
+  const devName = detectDevice();
 
-  document.getElementById('lv-bat').textContent  = bat + '%';
+  // Battery display
+  let batDisplay = batteryAvailable && batteryLevel !== null ? batteryLevel + '%' : (isIOS() ? 'N/A (iOS)' : 'detecting…');
+  // Use 85 as neutral fallback for ML only when unavailable
+  let batForML   = (batteryAvailable && batteryLevel !== null) ? batteryLevel : 85;
+
+  document.getElementById('lv-bat').textContent  = batDisplay;
   document.getElementById('lv-vib').textContent  = lastVib.toFixed(3) + ' m/s²';
-  document.getElementById('lv-plat').textContent = plat;
+  document.getElementById('lv-plat').textContent = devName;
+
+  // Dynamic memory estimate via performance API
+  let memEst = 50;
+  if (navigator.deviceMemory) {
+    // deviceMemory is in GB (1,2,4,8), estimate % as rough heuristic
+    memEst = Math.max(20, Math.min(85, Math.round(100 - navigator.deviceMemory * 8)));
+  }
 
   await sendToServer({
-    device_type: plat,
-    battery:     bat,
+    device_type: devName,
+    battery:     batForML,
     vibration:   lastVib,
-    cpu_load:    Math.round(Math.random() * 30 + 10),
-    memory:      Math.round(Math.random() * 30 + 30),
-    temperature: Math.round(35 + (100 - bat) * 0.3),
+    // CPU load can't be read from browser — use a stable estimate
+    cpu_load:    Math.round(20 + lastVib * 40),
+    memory:      memEst,
+    temperature: Math.round(32 + (100 - batForML) * 0.25 + lastVib * 8),
     disk_usage:  50,
+    battery_available: batteryAvailable,
   });
 }
 
@@ -1029,6 +1088,12 @@ function updateDashboard(devKey, d) {
 }
 
 function setGauge(id, val, unit) {
+  // Battery special handling — on iOS it's unavailable
+  if (id === 'bat' && isIOS() && !batteryAvailable) {
+    document.getElementById('g-bat').textContent = 'N/A';
+    document.getElementById('b-bat').style.width = '0%';
+    return;
+  }
   document.getElementById('g-' + id).textContent = Math.round(val) + unit;
   document.getElementById('b-' + id).style.width  = Math.min(100, val) + '%';
   const fill = document.getElementById('b-' + id);
@@ -1059,11 +1124,14 @@ async function refreshData() {
     ).join('');
     document.getElementById('dev-tabs').innerHTML = tabs;
 
-    if (!selectedDev && names.length) selectedDev = names[names.length-1];
-    const current = devs[selectedDev] || {};
-
     if (!names.length) { document.getElementById('empty').style.display = 'flex'; return; }
     document.getElementById('empty').style.display = 'none';
+
+    // If selectedDev not in data yet (page just loaded), pick it or fall back to last
+    if (!devs[selectedDev]) {
+      selectedDev = names.includes(selectedDev) ? selectedDev : names[names.length-1];
+    }
+    const current = devs[selectedDev] || {};
 
     renderRightPanel(current, d.history || []);
   } catch(e) {}
@@ -1127,8 +1195,31 @@ function renderRightPanel(d, hist) {
     </div>`;
 }
 
+// ── iOS MOTION REQUEST ────────────────────────────────────────
+function requestIOSMotion() {
+  if (typeof DeviceMotionEvent !== 'undefined' && DeviceMotionEvent.requestPermission) {
+    DeviceMotionEvent.requestPermission().then(s => {
+      if (s === 'granted') {
+        listenMotion();
+        document.getElementById('ios-btn-wrap').style.display = 'none';
+      }
+    }).catch(e => console.warn('Motion permission denied', e));
+  }
+}
+
 // ── BOOT ──────────────────────────────────────────────────────
-startLiveSensors();
+// Default selectedDev to the device currently opening the page
+selectedDev = detectDevice();
+
+// Show iOS grant button if needed
+if (isIOS()) {
+  document.getElementById('ios-btn-wrap').style.display = 'block';
+}
+
+// Init battery API before first scan
+initBattery().then(() => {
+  startLiveSensors();
+});
 setInterval(refreshData, 4000);
 refreshData();
 </script>
