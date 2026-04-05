@@ -1,597 +1,1142 @@
-"""
-Nexus PM - Predictive Maintenance Backend
-3 modes: Live System | Industrial | Custom Input
-ML: Isolation Forest + Random Forest + Linear Regression + Z-score + FFT
-"""
 import os, time
 import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
 from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.linear_model import LinearRegression
 
-app = FastAPI(title="Nexus PM API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI()
 
-# ── ML MODELS ─────────────────────────────────────────────────────────────────
+# ── ML MODELS ──────────────────────────────────────────────────
+iforest = IsolationForest(contamination=0.05, random_state=42)
+rf_clf  = RandomForestClassifier(n_estimators=100, random_state=42)
+lr_bat  = LinearRegression()
 
-# 1. Isolation Forest — unsupervised anomaly detection on 6 features
-iso = IsolationForest(n_estimators=200, contamination=0.05, random_state=42)
-baseline = np.column_stack([
-    np.random.normal(0.08, 0.02, 500),
-    np.random.normal(60,   15,   500),
-    np.random.normal(55,   15,   500),
-    np.random.normal(75,   15,   500),
-    np.random.normal(35,    5,   500),
-    np.random.normal(50,   20,   500),
+rng = np.random.default_rng(42)
+N   = 500
+
+# Training data
+X_normal = np.column_stack([
+    rng.uniform(0.0, 0.3,  N),   # vibration
+    rng.uniform(10,  70,   N),   # cpu
+    rng.uniform(20,  75,   N),   # ram
+    rng.uniform(40,  100,  N),   # battery
+    rng.uniform(30,  65,   N),   # temp
+    rng.uniform(10,  80,   N),   # disk
 ])
-iso.fit(baseline)
+iforest.fit(X_normal)
 
-# 2. Random Forest — supervised fault classification
-rf = RandomForestClassifier(n_estimators=100, random_state=42)
-_faults = ["NORMAL","BEARING_FAULT","MISALIGNMENT","IMBALANCE","OVERHEATING","WEAR"]
-_Xf, _yf = [], []
-for i, f in enumerate(_faults):
-    for _ in range(80):
-        row = [
-            np.random.normal([0.05,0.08,0.15,0.20,0.05,0.12][i], 0.01),
-            np.random.normal([40,50,70,80,95,60][i], 8),
-            np.random.normal([40,55,65,70,85,60][i], 8),
-            np.random.normal([85,75,65,60,50,70][i], 8),
-            np.random.normal([32,36,38,40,55,42][i], 3),
-            np.random.normal([40,50,55,60,70,65][i], 8),
-        ]
-        _Xf.append(row); _yf.append(i)
-rf.fit(_Xf, _yf)
+X_clf = np.vstack([X_normal,
+    np.column_stack([rng.uniform(0.8,2.0,50), rng.uniform(10,70,50), rng.uniform(20,75,50), rng.uniform(40,100,50), rng.uniform(30,65,50), rng.uniform(10,80,50)]),
+    np.column_stack([rng.uniform(0.0,0.3,50), rng.uniform(10,70,50), rng.uniform(20,75,50), rng.uniform(40,100,50), rng.uniform(70,100,50), rng.uniform(10,80,50)]),
+    np.column_stack([rng.uniform(0.4,0.8,50), rng.uniform(10,70,50), rng.uniform(20,75,50), rng.uniform(40,100,50), rng.uniform(30,65,50), rng.uniform(10,80,50)]),
+    np.column_stack([rng.uniform(0.0,0.3,50), rng.uniform(80,100,50), rng.uniform(85,100,50), rng.uniform(40,100,50), rng.uniform(30,65,50), rng.uniform(10,80,50)]),
+    np.column_stack([rng.uniform(0.0,0.3,50), rng.uniform(10,70,50), rng.uniform(20,75,50), rng.uniform(5,20,50), rng.uniform(30,65,50), rng.uniform(10,80,50)]),
+])
+y_clf = np.array([0]*N + [1]*50 + [2]*50 + [3]*50 + [4]*50 + [5]*50)
+rf_clf.fit(X_clf, y_clf)
 
-# 3. Linear Regression — trend + battery life prediction
-trend_model = LinearRegression()
+t = np.arange(N).reshape(-1, 1)
+bat_vals = 100 - (t.flatten() * 0.05) + rng.normal(0, 2, N)
+lr_bat.fit(t, bat_vals)
 
-# ── STORAGE ───────────────────────────────────────────────────────────────────
-history = {k: [] for k in ["vibration","cpu","memory","battery","temp","disk","score","time"]}
-MAX_HIST = 60
-last_result = {}
+FAULT_NAMES = ["NORMAL","BEARING_FAULT","OVERHEATING","MISALIGNMENT","WEAR_OVERLOAD","LOW_POWER"]
 
-def push(key, val):
-    history[key].append(val)
-    if len(history[key]) > MAX_HIST:
-        history[key].pop(0)
+all_devices: dict = {}
+history: list    = []
 
-# ── CORE ML ENGINE ────────────────────────────────────────────────────────────
-def run_ml(vib, cpu, mem, bat, temp, disk, device="system"):
-    t = time.time()
-    feat = np.array([[vib, cpu, mem, bat, temp, disk]])
-
-    # Isolation Forest anomaly score → health %
-    iso_score = iso.decision_function(feat)[0]
-    health = int(np.clip((iso_score + 0.5) * 130, 0, 100))
-
-    # Push to history
-    push("vibration", vib); push("cpu", cpu); push("memory", mem)
-    push("battery", bat); push("temp", temp); push("disk", disk); push("time", t)
-
-    # Z-score on vibration
-    vib_arr = np.array(history["vibration"])
-    z = 0.0
-    if len(vib_arr) > 2:
-        z = abs((vib - vib_arr.mean()) / (vib_arr.std() + 1e-9))
-
-    # Vibration trend via Linear Regression
-    trend, slope = "STABLE", 0.0
-    if len(vib_arr) >= 5:
-        x = np.arange(len(vib_arr)).reshape(-1, 1)
-        trend_model.fit(x, vib_arr)
-        slope = float(trend_model.coef_[0])
-        trend = "RISING" if slope > 0.002 else "FALLING" if slope < -0.002 else "STABLE"
-
-    # FFT dominant frequency
-    freq = 0.0
-    if len(vib_arr) >= 10:
-        fft = np.abs(np.fft.fft(vib_arr))
-        freqs = np.fft.fftfreq(len(vib_arr))
-        freq = float(abs(freqs[np.argmax(fft[1:]) + 1]))
-
-    # Random Forest fault classification
-    fault_idx = int(rf.predict(feat)[0])
-    fault = _faults[fault_idx]
-    fault_proba = float(rf.predict_proba(feat)[0][fault_idx])
-    if z > 3.5:   fault = "IMBALANCE"
-    elif z > 2.5: fault = "MISALIGNMENT"
-    if temp > 70: fault = "OVERHEATING"
-
-    # RUL estimate
-    rul_hours = None
-    if len(vib_arr) >= 10 and slope > 0:
-        steps_to_critical = max(0, (0.8 - vib) / (slope + 1e-9))
-        rul_hours = round(steps_to_critical * 2 / 60, 1)
-
-    # Battery life via Linear Regression
-    bat_life = "N/A"
-    bat_arr = np.array(history["battery"])
-    t_arr   = np.array(history["time"])
-    if len(bat_arr) >= 5 and bat >= 0:
-        trend_model.fit(t_arr.reshape(-1,1), bat_arr)
-        drain_per_sec = trend_model.coef_[0]
-        if drain_per_sec < 0:
-            mins = abs(bat / drain_per_sec) / 60
-            bat_life = f"{int(mins)} min" if mins < 120 else f"{mins/60:.1f} hr"
-
-    # Risk score
-    risk_score = 0
-    if health < 40:   risk_score += 40
-    elif health < 65: risk_score += 20
-    if z > 3:         risk_score += 25
-    elif z > 2:       risk_score += 12
-    if temp > 70:     risk_score += 20
-    elif temp > 55:   risk_score += 10
-    if bat < 15:      risk_score += 15
-    elif bat < 30:    risk_score += 7
-    if cpu > 90:      risk_score += 10
-    if mem > 90:      risk_score += 8
-    risk_score = min(risk_score, 100)
-    risk = "CRITICAL" if risk_score >= 60 else "WARNING" if risk_score >= 30 else "NOMINAL"
-
-    # Recommendations
-    recs = []
-    if temp > 70:       recs.append("🔥 Reduce load — thermal critical")
-    if bat < 20:        recs.append("🔋 Connect charger immediately")
-    if cpu > 85:        recs.append("⚙️ Close background processes")
-    if mem > 85:        recs.append("💾 Clear memory cache")
-    if z > 2.5:         recs.append("📳 Abnormal vibration — inspect mounting")
-    if trend == "RISING": recs.append("📈 Vibration rising — check bearings")
-    if disk > 90:       recs.append("💿 Disk nearly full — free space")
-    if not recs:        recs.append("✅ All parameters nominal")
-
-    push("score", risk_score)
-
-    return {
-        "health": health, "score": risk_score, "risk": risk,
-        "fault": fault, "fault_confidence": round(fault_proba * 100, 1),
-        "vibration": round(vib, 4), "z_score": round(z, 3),
-        "trend": trend, "slope": round(slope, 5),
-        "frequency": round(freq, 4), "rul_hours": rul_hours,
-        "cpu": round(cpu, 1), "memory": round(mem, 1),
-        "battery": round(bat, 1), "temp": round(temp, 1), "disk": round(disk, 1),
-        "battery_life": bat_life, "device": device,
-        "recommendations": recs,
-        "history": {k: history[k][-30:] for k in ["score","vibration","cpu","memory","temp"]},
-        "timestamp": round(t * 1000),
-    }
-
-# ── ROUTES ────────────────────────────────────────────────────────────────────
-@app.get("/")
-async def root():
-    return await monitor()
-
+# ── PREDICT ENDPOINT ──────────────────────────────────────────
 @app.post("/predict")
 async def predict(data: dict):
-    global last_result
-    last_result = run_ml(
-        float(data.get("vibration", 0.05)),
-        float(data.get("cpu", data.get("cpu_load", 50))),
-        float(data.get("memory", 50)),
-        float(data.get("battery", 75)),
-        float(data.get("temp", data.get("temperature", 35))),
-        float(data.get("disk", 50)),
-        str(data.get("device", data.get("device_type", "system")))
-    )
-    return last_result
+    global history
+    vib   = float(data.get("vibration", 0.1))
+    cpu   = float(data.get("cpu_load",  30))
+    ram   = float(data.get("memory",    40))
+    bat   = float(data.get("battery",   90))
+    temp  = float(data.get("temperature", 45))
+    disk  = float(data.get("disk_usage",  50))
+    dev   = str(data.get("device_type", "Unknown"))
+
+    vec   = [[vib, cpu, ram, bat, temp, disk]]
+    score = iforest.score_samples(vec)[0]
+    anom  = max(0, min(100, int((1 - (score + 0.5)) * 100)))
+    fault = FAULT_NAMES[int(rf_clf.predict(vec)[0])]
+    proba = float(rf_clf.predict_proba(vec)[0].max()) * 100
+    slope = float(lr_bat.coef_[0])
+    rul   = max(0, int(bat / max(0.01, abs(slope)))) if slope < 0 else 999
+
+    if anom >= 70:
+        risk, status = "CRITICAL", "CRITICAL FAILURE"
+        recs = ["HALT OPERATIONS — immediate inspection required",
+                f"Fault signature: {fault} detected at {proba:.0f}% confidence",
+                "Check bearing assemblies and lubrication channels",
+                "Isolate affected subsystem before restart"]
+    elif anom >= 40:
+        risk, status = "WARNING", "MAINTENANCE ADVISORY"
+        recs = [f"Schedule maintenance within 24h — {fault} pattern emerging",
+                "Monitor vibration trend — currently elevated",
+                f"Battery RUL estimate: {rul}h at current drain rate",
+                "Inspect cooling system — thermal margins shrinking"]
+    else:
+        risk, status = "NOMINAL", "ALL SYSTEMS NOMINAL"
+        recs = ["Continue standard monitoring intervals",
+                f"Next scheduled check in {min(168, rul)}h",
+                "No anomalies detected by Isolation Forest",
+                "System operating within design envelope"]
+
+    trend = "RISING" if slope > 0.01 else "FALLING" if slope < -0.01 else "STABLE"
+    result = dict(vibration=round(vib,3), cpu_load=cpu, memory=ram,
+                  battery=bat, temperature=temp, disk_usage=disk,
+                  device=dev, anomaly_score=anom, fault=fault,
+                  fault_confidence=round(proba,1), risk=risk, status=status,
+                  rul_hours=rul, trend=trend, recommendations=recs,
+                  z_score=round((vib-0.15)/0.1, 2))
+
+    all_devices[dev] = result
+    history.append(anom)
+    if len(history) > 30:
+        history.pop(0)
+    return result
 
 @app.get("/data")
-async def get_data():
-    return last_result if last_result else {"error": "No data yet"}
+async def data():
+    latest = list(all_devices.values())[-1] if all_devices else {}
+    return {**latest, "history": history, "all_devices": all_devices}
 
+@app.get("/")
+async def root():
+    return {"status": "online", "version": "2.0.0"}
+
+# ── MONITOR DASHBOARD ─────────────────────────────────────────
 @app.get("/monitor", response_class=HTMLResponse)
 async def monitor():
-    return DASHBOARD_HTML
-
-DASHBOARD_HTML = r"""<!DOCTYPE html>
+    return r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>NEXUS PM — Predictive Maintenance</title>
-<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NEXUS — Predictive Maintenance</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Bebas+Neue&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#04080f;--bg2:#080f1a;--bg3:#0d1825;--bg4:#122030;--cyan:#00e5ff;--green:#00ff9d;--yellow:#ffe600;--red:#ff2d55;--orange:#ff6b00;--text:#c8dff0;--text2:#5a7a99;--text3:#2a3f55;--r:8px}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:'Rajdhani',sans-serif;min-height:100vh;overflow-x:hidden}
-body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,229,255,.012) 2px,rgba(0,229,255,.012) 4px);pointer-events:none;z-index:0}
-.shell{max-width:1400px;margin:0 auto;padding:14px;position:relative;z-index:1}
-.mono{font-family:'Share Tech Mono',monospace}
-.topbar{display:flex;align-items:center;gap:12px;padding:10px 18px;background:var(--bg2);border:1px solid #0a2a40;border-radius:var(--r);margin-bottom:14px;flex-wrap:wrap;gap:10px}
-.logo{font-family:'Share Tech Mono',monospace;font-size:15px;color:var(--cyan);letter-spacing:3px}
-.logo span{color:var(--green)}
-.mode-tabs{display:flex;gap:6px;flex:1;justify-content:center}
-.mtab{padding:5px 16px;border:1px solid var(--text3);border-radius:5px;cursor:pointer;font-size:13px;font-weight:600;letter-spacing:1px;background:transparent;color:var(--text2);transition:.2s;font-family:'Rajdhani',sans-serif}
-.mtab.active{border-color:var(--cyan);color:var(--cyan);background:rgba(0,229,255,.08)}
-.pulse-dot{width:9px;height:9px;border-radius:50%;background:var(--green);animation:pdot 1.5s infinite;flex-shrink:0}
-@keyframes pdot{0%,100%{box-shadow:0 0 0 0 rgba(0,255,157,.5)}70%{box-shadow:0 0 0 8px rgba(0,255,157,0)}}
-.risk-banner{padding:12px 18px;border-radius:var(--r);margin-bottom:14px;display:flex;align-items:center;gap:16px;border:1px solid;transition:all .4s;flex-wrap:wrap}
-.risk-banner.NOMINAL{background:rgba(0,255,157,.06);border-color:rgba(0,255,157,.3)}
-.risk-banner.WARNING{background:rgba(255,230,0,.06);border-color:rgba(255,230,0,.4);animation:wpulse 2s infinite}
-.risk-banner.CRITICAL{background:rgba(255,45,85,.1);border-color:rgba(255,45,85,.6);animation:cpulse .8s infinite}
-@keyframes wpulse{0%,100%{border-color:rgba(255,230,0,.4)}50%{border-color:rgba(255,230,0,.9)}}
-@keyframes cpulse{0%,100%{border-color:rgba(255,45,85,.6)}50%{border-color:rgba(255,45,85,1)}}
-.risk-icon{font-size:30px}
-.risk-text h2{font-size:22px;font-weight:700;letter-spacing:3px}
-.risk-text p{font-size:13px;color:var(--text2);margin-top:2px}
-.risk-score-big{margin-left:auto;text-align:right}
-.risk-score-big .num{font-family:'Share Tech Mono',monospace;font-size:46px;line-height:1}
-.risk-score-big .lbl{font-size:10px;color:var(--text3);letter-spacing:2px}
-.main-grid{display:grid;grid-template-columns:260px 1fr 280px;gap:14px;margin-bottom:14px}
-@media(max-width:1100px){.main-grid{grid-template-columns:1fr 1fr}}
-@media(max-width:700px){.main-grid{grid-template-columns:1fr}}
-.card{background:var(--bg2);border:1px solid #0a2a40;border-radius:var(--r);padding:16px;animation:fadein .4s ease both}
-@keyframes fadein{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-.card-title{font-size:10px;letter-spacing:2px;color:var(--text3);text-transform:uppercase;margin-bottom:12px;display:flex;align-items:center;gap:8px}
-.card-title::before{content:'';width:3px;height:12px;background:var(--cyan);border-radius:2px}
-.gauge-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.gauge-wrap{display:flex;flex-direction:column;align-items:center;gap:4px}
-.gauge-svg{width:110px;height:65px;overflow:visible}
-.gauge-label{font-size:11px;color:var(--text2);letter-spacing:1px;text-align:center}
-.gauge-val{font-family:'Share Tech Mono',monospace;font-size:17px;font-weight:700;text-align:center}
-.big-gauge-wrap{display:flex;flex-direction:column;align-items:center;padding:8px 0}
-.big-gauge-svg{width:200px;height:120px;overflow:visible}
-.big-gauge-num{font-family:'Share Tech Mono',monospace;font-size:46px;font-weight:700;text-align:center;line-height:1;margin-top:-6px}
-.big-gauge-sub{font-size:12px;color:var(--text2);text-align:center;margin-top:4px;letter-spacing:1px}
-.metric-row{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--bg4)}
-.metric-row:last-child{border-bottom:none}
-.metric-icon{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
-.metric-info{flex:1;min-width:0}
-.metric-name{font-size:12px;color:var(--text2);font-weight:600;letter-spacing:.5px}
-.metric-val{font-family:'Share Tech Mono',monospace;font-size:16px;font-weight:700;line-height:1.2}
-.metric-bar{height:3px;background:var(--bg4);border-radius:2px;margin-top:4px}
-.metric-bar-fill{height:100%;border-radius:2px;transition:width .6s ease}
-.fault-box{border-radius:var(--r);padding:14px 16px;margin-bottom:12px;border:1px solid}
-.fault-name{font-size:18px;font-weight:700;letter-spacing:2px;margin-bottom:4px}
-.fault-conf{font-size:12px;color:var(--text2)}
-.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.stat-box{background:var(--bg3);border:1px solid var(--bg4);border-radius:6px;padding:10px 12px}
-.stat-label{font-size:10px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px}
-.stat-val{font-family:'Share Tech Mono',monospace;font-size:15px;font-weight:700}
-.spark-container{position:relative;height:80px;margin-top:8px}
-.rec-item{display:flex;align-items:flex-start;gap:8px;padding:7px 0;border-bottom:1px solid var(--bg4);font-size:13px;font-weight:500}
-.rec-item:last-child{border-bottom:none}
-.inp-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
-.inp-group{display:flex;flex-direction:column;gap:5px}
-.inp-group label{font-size:11px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase}
-.inp-group input{background:var(--bg3);border:1px solid var(--bg4);border-radius:6px;color:var(--text);font-family:'Share Tech Mono',monospace;font-size:14px;padding:8px 12px;outline:none;transition:.2s;width:100%}
-.inp-group input:focus{border-color:var(--cyan);box-shadow:0 0 0 2px rgba(0,229,255,.1)}
-.inp-group .hint{font-size:10px;color:var(--text3)}
-.submit-btn{width:100%;padding:12px;background:rgba(0,229,255,.1);border:1px solid var(--cyan);border-radius:var(--r);color:var(--cyan);font-family:'Rajdhani',sans-serif;font-size:15px;font-weight:700;letter-spacing:2px;cursor:pointer;transition:.2s}
-.submit-btn:hover{background:rgba(0,229,255,.2)}
-.start-btn{padding:14px 32px;background:rgba(0,255,157,.1);border:1px solid var(--green);border-radius:var(--r);color:var(--green);font-family:'Rajdhani',sans-serif;font-size:16px;font-weight:700;letter-spacing:2px;cursor:pointer;transition:.2s;margin:8px}
-.start-btn:hover{background:rgba(0,255,157,.2)}
-.bottom-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
-@media(max-width:900px){.bottom-grid{grid-template-columns:1fr 1fr}}
-@media(max-width:600px){.bottom-grid{grid-template-columns:1fr}}
+:root {
+  --bg:      #0c0b08;
+  --surface: #131210;
+  --border:  #2a2720;
+  --amber:   #e8a020;
+  --amber2:  #c47a10;
+  --amber-lo:#3a2800;
+  --red:     #d63c2a;
+  --red-lo:  #3a0e08;
+  --green:   #4a8c5c;
+  --green-lo:#0d2218;
+  --text:    #d4c8a8;
+  --muted:   #6b6048;
+  --mono:    'Share Tech Mono', monospace;
+  --display: 'Bebas Neue', cursive;
+  --body:    'DM Sans', sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { font-size: 14px; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--body);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* Scanline overlay */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,0.06) 2px,
+    rgba(0,0,0,0.06) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ── HEADER ── */
+header {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 2px solid var(--border);
+  background: var(--surface);
+}
+
+.header-brand {
+  padding: 18px 32px;
+  border-right: 2px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.brand-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 4px;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.brand-name {
+  font-family: var(--display);
+  font-size: 38px;
+  color: var(--amber);
+  line-height: 1;
+  letter-spacing: 3px;
+}
+
+.header-status {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  padding: 0 32px;
+  gap: 32px;
+}
+
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 2px;
+  color: var(--muted);
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(74,140,92,0.4); }
+  50%       { opacity: 0.7; box-shadow: 0 0 0 4px rgba(74,140,92,0); }
+}
+
+.header-time {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  text-align: right;
+  line-height: 1.8;
+}
+
+/* ── LAYOUT ── */
+.shell {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  min-height: calc(100vh - 80px);
+}
+
+.left-panel {
+  border-right: 2px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── SECTION HEADERS ── */
+.sec-hdr {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 4px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--surface);
+  text-transform: uppercase;
+}
+
+.sec-hdr::before {
+  content: '';
+  display: block;
+  width: 3px;
+  height: 10px;
+  background: var(--amber);
+}
+
+/* ── RISK METER ── */
+.risk-block {
+  padding: 28px 24px 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.risk-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 3px;
+  color: var(--muted);
+  margin-bottom: 16px;
+}
+
+.risk-arc-wrap {
+  position: relative;
+  width: 200px;
+  height: 120px;
+  margin: 0 auto 16px;
+}
+
+.risk-arc-wrap svg { width: 100%; height: 100%; overflow: visible; }
+
+.risk-score-big {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  text-align: center;
+}
+
+.risk-num {
+  font-family: var(--display);
+  font-size: 56px;
+  line-height: 1;
+  color: var(--amber);
+  transition: color 0.5s;
+}
+
+.risk-unit {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: var(--muted);
+}
+
+.risk-badge {
+  display: block;
+  margin: 14px auto 0;
+  width: fit-content;
+  padding: 6px 18px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 3px;
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  background: var(--amber-lo);
+  transition: all 0.4s;
+}
+
+/* ── MINI GAUGES ── */
+.gauges-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--border);
+  border-top: 1px solid var(--border);
+}
+
+.gauge-cell {
+  background: var(--bg);
+  padding: 16px;
+}
+
+.gc-label {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 2px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.gc-value {
+  font-family: var(--display);
+  font-size: 28px;
+  color: var(--text);
+  line-height: 1;
+  margin-bottom: 8px;
+}
+
+.gc-bar {
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.gc-fill {
+  height: 100%;
+  background: var(--amber);
+  transition: width 0.8s cubic-bezier(0.4,0,0.2,1);
+}
+
+/* ── FAULT CARD ── */
+.fault-block {
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.fault-name {
+  font-family: var(--display);
+  font-size: 22px;
+  letter-spacing: 2px;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+.fault-conf {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.fault-conf span { color: var(--amber); }
+
+/* ── MODE SWITCHER ── */
+.mode-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.mode-tab {
+  padding: 12px 8px;
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+  color: var(--muted);
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.mode-tab:hover { background: var(--surface); color: var(--text); }
+.mode-tab.active { background: var(--amber-lo); color: var(--amber); }
+
+/* ── FORM FIELDS ── */
+.input-panel {
+  padding: 20px;
+  border-bottom: 1px solid var(--border);
+  display: none;
+}
+
+.input-panel.active { display: block; }
+
+.field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field label {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 2px;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.field input {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 8px 10px;
+  outline: none;
+  transition: border-color 0.2s;
+  width: 100%;
+}
+
+.field input:focus { border-color: var(--amber); }
+
+.scan-btn {
+  width: 100%;
+  padding: 12px;
+  background: var(--amber);
+  border: none;
+  color: #0c0b08;
+  font-family: var(--display);
+  font-size: 18px;
+  letter-spacing: 3px;
+  cursor: pointer;
+  margin-top: 8px;
+  transition: background 0.2s, transform 0.1s;
+}
+
+.scan-btn:hover  { background: var(--amber2); }
+.scan-btn:active { transform: scale(0.99); }
+
+/* ── LIVE AUTO PANEL ── */
+.live-panel {
+  padding: 20px;
+  border-bottom: 1px solid var(--border);
+  display: none;
+}
+
+.live-panel.active { display: block; }
+
+.live-row {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.live-row span:last-child { color: var(--text); }
+
+.live-ping {
+  margin-top: 12px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: var(--muted);
+}
+
+.live-ping span {
+  display: inline-block;
+  animation: blink-txt 1s step-start infinite;
+  color: var(--amber);
+}
+
+@keyframes blink-txt { 50% { opacity: 0; } }
+
+/* ── RIGHT PANEL ── */
+.right-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── RECOMMENDATION STRIP ── */
+.rec-strip {
+  border-bottom: 1px solid var(--border);
+  padding: 20px 32px;
+  background: var(--surface);
+}
+
+.rec-title {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 3px;
+  color: var(--muted);
+  margin-bottom: 14px;
+}
+
+.rec-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rec-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.rec-num {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--amber);
+  min-width: 20px;
+  padding-top: 1px;
+}
+
+/* ── CHARTS ROW ── */
+.charts-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 1px;
+  background: var(--border);
+  flex: 1;
+}
+
+.chart-block {
+  background: var(--bg);
+  padding: 20px;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+}
+
+.chart-title {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 3px;
+  color: var(--muted);
+  margin-bottom: 16px;
+  text-transform: uppercase;
+}
+
+.spark-area {
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+}
+
+.spark-col {
+  flex: 1;
+  min-width: 4px;
+  border-radius: 1px 1px 0 0;
+  transition: height 0.4s ease;
+}
+
+/* ── DEVICE TABS ── */
+.dev-tabs {
+  display: flex;
+  gap: 1px;
+  background: var(--border);
+  padding: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.dev-tab {
+  padding: 8px 20px;
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: var(--muted);
+  border: none;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.dev-tab:hover  { background: var(--surface); color: var(--text); }
+.dev-tab.active { background: var(--surface); color: var(--amber); border-bottom: 2px solid var(--amber); }
+
+/* ── METADATA ROW ── */
+.meta-row {
+  display: flex;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.meta-cell {
+  flex: 1;
+  padding: 12px 24px;
+  border-right: 1px solid var(--border);
+}
+
+.meta-cell:last-child { border-right: none; }
+
+.meta-k {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 2px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.meta-v {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* ── STATUS STATES ── */
+.nominal  .risk-num { color: var(--green); }
+.nominal  .risk-badge { border-color: var(--green); color: var(--green); background: var(--green-lo); }
+
+.critical .risk-num { color: var(--red); }
+.critical .risk-badge { border-color: var(--red); color: var(--red); background: var(--red-lo); animation: flash-badge 0.8s ease-in-out infinite; }
+
+@keyframes flash-badge { 50% { opacity: 0.5; } }
+
+/* ── EMPTY STATE ── */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  padding: 60px 32px;
+  gap: 16px;
+  color: var(--muted);
+}
+
+.empty-state .big-label {
+  font-family: var(--display);
+  font-size: 64px;
+  color: var(--border);
+  letter-spacing: 6px;
+}
+
+.empty-state p {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-align: center;
+  line-height: 2;
+}
+
+/* ── RESPONSIVE ── */
+@media (max-width: 900px) {
+  .shell { grid-template-columns: 1fr; }
+  .right-panel { border-top: 2px solid var(--border); }
+  .charts-row { grid-template-columns: 1fr; }
+  .meta-row { flex-wrap: wrap; }
+}
 </style>
 </head>
 <body>
+
+<header>
+  <div class="header-brand">
+    <span class="brand-label">System</span>
+    <span class="brand-name">NEXUS</span>
+  </div>
+  <div class="header-status">
+    <div class="status-pill">
+      <span class="dot" id="conn-dot"></span>
+      <span id="conn-label">CONNECTING</span>
+    </div>
+    <div class="status-pill" style="gap:6px">
+      <span style="color:var(--muted)">DEVICES —</span>
+      <span id="dev-count" style="color:var(--amber)">0</span>
+    </div>
+    <div class="header-time">
+      <div id="clock">--:--:--</div>
+      <div id="date-line" style="opacity:0.4"></div>
+    </div>
+  </div>
+</header>
+
 <div class="shell">
 
-<div class="topbar">
-  <div class="logo mono">NEXUS<span>/PM</span></div>
-  <div class="mode-tabs">
-    <button class="mtab active" onclick="setMode('live')" id="tab-live">⚡ LIVE SYSTEM</button>
-    <button class="mtab" onclick="setMode('industrial')" id="tab-industrial">🏭 INDUSTRIAL</button>
-    <button class="mtab" onclick="setMode('custom')" id="tab-custom">✏️ CUSTOM INPUT</button>
-  </div>
-  <div class="pulse-dot"></div>
-  <div class="mono" style="font-size:11px;color:var(--text3)" id="clock">--:--:--</div>
-</div>
+  <!-- LEFT PANEL -->
+  <div class="left-panel">
 
-<div class="risk-banner NOMINAL" id="risk-banner">
-  <div class="risk-icon" id="risk-icon">✅</div>
-  <div class="risk-text">
-    <h2 id="risk-title" style="color:var(--green)">NOMINAL</h2>
-    <p id="risk-desc">Awaiting sensor data</p>
-  </div>
-  <div class="risk-score-big">
-    <div class="num" id="big-score" style="color:var(--green)">--</div>
-    <div class="lbl">RISK SCORE / 100</div>
-  </div>
-</div>
-
-<!-- LIVE MODE -->
-<div id="mode-live">
-  <div id="phone-prompt" class="card" style="margin-bottom:14px;text-align:center;padding:24px;display:none">
-    <div class="card-title" style="justify-content:center">PHONE SENSOR ACCESS</div>
-    <div style="font-size:48px;margin:8px 0">📱</div>
-    <p style="color:var(--text2);font-size:13px;margin-bottom:16px">Tap to grant motion + battery sensor access</p>
-    <button class="start-btn" onclick="startPhoneSensors()">▶ GRANT ACCESS</button>
-  </div>
-
-  <div class="main-grid">
-    <div style="display:flex;flex-direction:column;gap:14px">
-      <div class="card">
-        <div class="card-title">Health Index</div>
-        <div class="big-gauge-wrap">
-          <svg class="big-gauge-svg" viewBox="0 0 200 120">
-            <defs>
-              <linearGradient id="ag" x1="0%" y1="0%" x2="100%" y2="0%">
-                <stop offset="0%" stop-color="#00ff9d"/>
-                <stop offset="50%" stop-color="#ffe600"/>
-                <stop offset="100%" stop-color="#ff2d55"/>
-              </linearGradient>
-            </defs>
-            <path d="M20,110 A80,80 0 0,1 180,110" fill="none" stroke="#0d1825" stroke-width="18" stroke-linecap="round"/>
-            <path id="big-arc" d="M20,110 A80,80 0 0,1 180,110" fill="none" stroke="url(#ag)" stroke-width="18" stroke-linecap="round" stroke-dasharray="251.2" stroke-dashoffset="251.2" style="transition:stroke-dashoffset .8s ease"/>
-          </svg>
-          <div class="big-gauge-num" id="health-num" style="color:var(--green)">--</div>
-          <div class="big-gauge-sub" id="health-lbl">AWAITING DATA</div>
+    <div class="sec-hdr">Anomaly Score</div>
+    <div class="risk-block" id="risk-state">
+      <div class="risk-label">ISOLATION FOREST · PREDICTIVE INDEX</div>
+      <div class="risk-arc-wrap">
+        <svg viewBox="0 0 200 110" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <!-- Track -->
+          <path d="M 20 100 A 80 80 0 0 1 180 100" stroke="#2a2720" stroke-width="8" stroke-linecap="round"/>
+          <!-- Fill -->
+          <path id="arc-fill" d="M 20 100 A 80 80 0 0 1 180 100" stroke="#e8a020"
+                stroke-width="8" stroke-linecap="round"
+                stroke-dasharray="251.2" stroke-dashoffset="251.2"
+                style="transition: stroke-dashoffset 1s cubic-bezier(0.4,0,0.2,1), stroke 0.5s"/>
+          <!-- Ticks -->
+          <g stroke="#2a2720" stroke-width="1">
+            <line x1="20"  y1="100" x2="10"  y2="100"/>
+            <line x1="180" y1="100" x2="190" y2="100"/>
+            <line x1="100" y1="20"  x2="100" y2="8"/>
+            <line x1="57"  y1="43"  x2="50"  y2="36"/>
+            <line x1="143" y1="43"  x2="150" y2="36"/>
+          </g>
+          <text x="16"  y="118" fill="#6b6048" font-family="'Share Tech Mono'" font-size="9">0</text>
+          <text x="176" y="118" fill="#6b6048" font-family="'Share Tech Mono'" font-size="9">100</text>
+        </svg>
+        <div class="risk-score-big">
+          <div class="risk-num" id="risk-num">--</div>
+          <div class="risk-unit">/ 100</div>
         </div>
       </div>
-      <div class="card">
-        <div class="card-title">Fault Classification</div>
-        <div class="fault-box" id="fault-box" style="background:rgba(0,255,157,.06);border-color:rgba(0,255,157,.3)">
-          <div class="fault-name" id="fault-name" style="color:var(--green)">NORMAL</div>
-          <div class="fault-conf" id="fault-conf">Confidence: -- | Model: Random Forest</div>
-        </div>
-        <div class="stats-grid">
-          <div class="stat-box"><div class="stat-label">Z-Score</div><div class="stat-val" id="z-score" style="color:var(--cyan)">--</div></div>
-          <div class="stat-box"><div class="stat-label">Frequency</div><div class="stat-val" id="freq-val" style="color:var(--cyan)">--</div></div>
-          <div class="stat-box"><div class="stat-label">Trend</div><div class="stat-val" id="trend-val">--</div></div>
-          <div class="stat-box"><div class="stat-label">RUL Est.</div><div class="stat-val" id="rul-val" style="color:var(--yellow)">--</div></div>
-        </div>
+      <span class="risk-badge" id="risk-badge">AWAITING DATA</span>
+    </div>
+
+    <!-- mini gauges -->
+    <div class="gauges-grid">
+      <div class="gauge-cell">
+        <div class="gc-label">BATTERY</div>
+        <div class="gc-value" id="g-bat">--%</div>
+        <div class="gc-bar"><div class="gc-fill" id="b-bat" style="width:0%"></div></div>
+      </div>
+      <div class="gauge-cell">
+        <div class="gc-label">CPU LOAD</div>
+        <div class="gc-value" id="g-cpu">--%</div>
+        <div class="gc-bar"><div class="gc-fill" id="b-cpu" style="width:0%"></div></div>
+      </div>
+      <div class="gauge-cell">
+        <div class="gc-label">MEMORY</div>
+        <div class="gc-value" id="g-ram">--%</div>
+        <div class="gc-bar"><div class="gc-fill" id="b-ram" style="width:0%"></div></div>
+      </div>
+      <div class="gauge-cell">
+        <div class="gc-label">VIBRATION</div>
+        <div class="gc-value" id="g-vib">-.---</div>
+        <div class="gc-bar"><div class="gc-fill" id="b-vib" style="width:0%"></div></div>
       </div>
     </div>
 
-    <div style="display:flex;flex-direction:column;gap:14px">
-      <div class="card">
-        <div class="card-title">Parameter Gauges</div>
-        <div class="gauge-grid" id="gauge-grid"><div style="color:var(--text3);font-size:12px;grid-column:span 2">Awaiting data...</div></div>
+    <!-- fault -->
+    <div class="sec-hdr">Fault Classification</div>
+    <div class="fault-block">
+      <div class="fault-name" id="fault-name">AWAITING SCAN</div>
+      <div class="fault-conf">Random Forest confidence: <span id="fault-conf">--%</span></div>
+    </div>
+
+    <!-- mode tabs -->
+    <div class="sec-hdr">Input Mode</div>
+    <div class="mode-tabs">
+      <button class="mode-tab active" onclick="setMode('live')">⬤ Live</button>
+      <button class="mode-tab"        onclick="setMode('industrial')">⬡ Industrial</button>
+      <button class="mode-tab"        onclick="setMode('custom')">◧ Custom</button>
+    </div>
+
+    <!-- live panel -->
+    <div class="live-panel active" id="panel-live">
+      <div class="live-row"><span>BATTERY</span>    <span id="lv-bat">detecting…</span></div>
+      <div class="live-row"><span>ACCELEROMETER</span><span id="lv-vib">detecting…</span></div>
+      <div class="live-row"><span>PLATFORM</span>   <span id="lv-plat">detecting…</span></div>
+      <div class="live-row"><span>INTERVAL</span>   <span>4 000 ms</span></div>
+      <div class="live-ping">STATUS <span>▌</span> SCANNING</div>
+    </div>
+
+    <!-- industrial panel -->
+    <div class="input-panel" id="panel-industrial">
+      <div class="field-row">
+        <div class="field"><label>Vibration m/s²</label><input id="i-vib"  type="number" step="0.01" value="0.15" placeholder="0.15"></div>
+        <div class="field"><label>Temperature °C</label><input id="i-temp" type="number" step="1"    value="45"   placeholder="45"></div>
       </div>
-      <div class="card">
-        <div class="card-title">Live Metrics</div>
-        <div id="metrics-list"><div style="color:var(--text3);font-size:12px">Awaiting data...</div></div>
+      <div class="field-row">
+        <div class="field"><label>Battery / Power %</label><input id="i-bat"  type="number" step="1" value="85"  placeholder="85"></div>
+        <div class="field"><label>CPU / Node Load %</label><input id="i-cpu"  type="number" step="1" value="30"  placeholder="30"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Memory / RAM %</label><input id="i-ram"  type="number" step="1" value="50"  placeholder="50"></div>
+        <div class="field"><label>Disk / Storage %</label><input id="i-disk" type="number" step="1" value="40"  placeholder="40"></div>
+      </div>
+      <button class="scan-btn" onclick="sendIndustrial()">RUN ANALYSIS</button>
+    </div>
+
+    <!-- custom panel -->
+    <div class="input-panel" id="panel-custom">
+      <div class="field-row">
+        <div class="field"><label>Vibration</label><input id="c-vib"  type="number" step="0.01" value="0.5"></div>
+        <div class="field"><label>Temperature</label><input id="c-temp" type="number" step="1"    value="70"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Battery %</label><input id="c-bat"  type="number" step="1" value="20"></div>
+        <div class="field"><label>CPU %</label><input id="c-cpu"  type="number" step="1" value="90"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Memory %</label><input id="c-ram"  type="number" step="1" value="88"></div>
+        <div class="field"><label>Disk %</label><input id="c-disk" type="number" step="1" value="95"></div>
+      </div>
+      <button class="scan-btn" onclick="sendCustom()">RUN ANALYSIS</button>
+    </div>
+
+  </div><!-- /left-panel -->
+
+  <!-- RIGHT PANEL -->
+  <div class="right-panel">
+
+    <div class="dev-tabs" id="dev-tabs"></div>
+
+    <div id="main-content">
+      <div class="empty-state" id="empty">
+        <div class="big-label">IDLE</div>
+        <p>NO PROBE DATA RECEIVED<br>SELECT AN INPUT MODE AND RUN A SCAN</p>
       </div>
     </div>
 
-    <div style="display:flex;flex-direction:column;gap:14px">
-      <div class="card">
-        <div class="card-title">AI Recommendations</div>
-        <div id="recs-list"><div style="color:var(--text3);font-size:13px">Awaiting analysis...</div></div>
-      </div>
-      <div class="card">
-        <div class="card-title">Battery Intelligence</div>
-        <div style="text-align:center;padding:8px 0">
-          <div class="mono" style="font-size:38px;color:var(--green)" id="bat-pct">--%</div>
-          <div style="font-size:12px;color:var(--text2);margin-top:4px" id="bat-life">Life: --</div>
-        </div>
-        <div style="height:6px;background:var(--bg4);border-radius:3px;margin-bottom:12px"><div id="bat-bar" style="height:100%;border-radius:3px;width:0%;background:var(--green);transition:width .6s"></div></div>
-        <div class="stats-grid">
-          <div class="stat-box"><div class="stat-label">Vibration</div><div class="stat-val mono" id="vib-val" style="color:var(--cyan)">--</div></div>
-          <div class="stat-box"><div class="stat-label">Device</div><div class="stat-val" id="dev-val" style="font-size:12px">--</div></div>
-        </div>
-      </div>
-    </div>
   </div>
 
-  <div class="bottom-grid">
-    <div class="card"><div class="card-title">Risk Score History</div><div class="spark-container"><canvas id="c-score"></canvas></div></div>
-    <div class="card"><div class="card-title">Vibration History</div><div class="spark-container"><canvas id="c-vib"></canvas></div></div>
-    <div class="card"><div class="card-title">CPU + Memory</div><div class="spark-container"><canvas id="c-cpu"></canvas></div></div>
-  </div>
-</div>
+</div><!-- /shell -->
 
-<!-- INDUSTRIAL MODE -->
-<div id="mode-industrial" style="display:none">
-  <div class="card">
-    <div class="card-title">Industrial Machine Parameters</div>
-    <div class="inp-grid">
-      <div class="inp-group"><label>Vibration (m/s²)</label><input type="number" id="ind-vib" value="0.08" step="0.01" min="0"/><div class="hint">Normal &lt;0.15 | Warning &gt;0.5 | Critical &gt;0.8</div></div>
-      <div class="inp-group"><label>Temperature (°C)</label><input type="number" id="ind-temp" value="38" step="1"/><div class="hint">Normal &lt;55 | Warning 55–70 | Critical &gt;70</div></div>
-      <div class="inp-group"><label>RPM / Speed (%)</label><input type="number" id="ind-cpu" value="65" step="1" min="0" max="100"/><div class="hint">Machine load percentage</div></div>
-      <div class="inp-group"><label>Pressure / Load (%)</label><input type="number" id="ind-mem" value="55" step="1" min="0" max="100"/><div class="hint">Hydraulic or mechanical load</div></div>
-      <div class="inp-group"><label>Power Supply (%)</label><input type="number" id="ind-bat" value="90" step="1" min="0" max="100"/><div class="hint">Input power health</div></div>
-      <div class="inp-group"><label>Wear Index (%)</label><input type="number" id="ind-disk" value="40" step="1" min="0" max="100"/><div class="hint">Cumulative wear / cycle count</div></div>
-    </div>
-    <button class="submit-btn" onclick="submitIndustrial()">⚙️ RUN ML ANALYSIS</button>
-  </div>
-</div>
-
-<!-- CUSTOM MODE -->
-<div id="mode-custom" style="display:none">
-  <div class="card">
-    <div class="card-title">Custom Parameter Input</div>
-    <div class="inp-grid">
-      <div class="inp-group"><label>Vibration / Anomaly Signal</label><input type="number" id="cv-in" value="0.08" step="0.001"/></div>
-      <div class="inp-group"><label>CPU / Primary Load (%)</label><input type="number" id="cc-in" value="50" step="1" min="0" max="100"/></div>
-      <div class="inp-group"><label>Memory / Secondary Load (%)</label><input type="number" id="cm-in" value="50" step="1" min="0" max="100"/></div>
-      <div class="inp-group"><label>Battery / Power (%)</label><input type="number" id="cb-in" value="80" step="1" min="0" max="100"/></div>
-      <div class="inp-group"><label>Temperature (°C)</label><input type="number" id="ct-in" value="35" step="1"/></div>
-      <div class="inp-group"><label>Disk / Wear (%)</label><input type="number" id="cd-in" value="50" step="1" min="0" max="100"/></div>
-    </div>
-    <button class="submit-btn" onclick="submitCustom()">🧠 ANALYZE WITH ML</button>
-  </div>
-</div>
-
-</div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
-let mode='live', charts={}, phoneActive=false, batteryLevel=-1;
+// ── STATE ──────────────────────────────────────────────────────
+let selectedDev = null;
+let currentMode = 'live';
+let liveData    = {};
+let liveInterval;
+let motionEnabled = false;
+let lastVib = 0;
 
-setInterval(()=>{document.getElementById('clock').textContent=new Date().toLocaleTimeString('en',{hour12:false})},1000);
+// ── CLOCK ─────────────────────────────────────────────────────
+function tickClock() {
+  const n = new Date();
+  document.getElementById('clock').textContent = n.toLocaleTimeString('en-GB');
+  document.getElementById('date-line').textContent =
+    n.toLocaleDateString('en-GB', {day:'2-digit', month:'short', year:'numeric'}).toUpperCase();
+}
+setInterval(tickClock, 1000);
+tickClock();
 
-function setMode(m){
-  mode=m;
-  ['live','industrial','custom'].forEach(k=>{
-    document.getElementById('mode-'+k).style.display=k===m?'block':'none';
-    document.getElementById('tab-'+k).classList.toggle('active',k===m);
+// ── MODE ──────────────────────────────────────────────────────
+function setMode(m) {
+  currentMode = m;
+  document.querySelectorAll('.mode-tab').forEach((t,i) => {
+    t.classList.toggle('active', ['live','industrial','custom'][i] === m);
   });
-  if(m==='live'&&/Mobi|Android/i.test(navigator.userAgent)&&!phoneActive)
-    document.getElementById('phone-prompt').style.display='block';
+  ['live','industrial','custom'].forEach(id => {
+    const lp = document.getElementById('panel-' + id);
+    const ip = document.getElementById('panel-' + id);
+    if (lp) lp.classList.toggle('active', id === m);
+  });
+  // Re-show correct panel
+  document.getElementById('panel-live').classList.toggle('active', m === 'live');
+  document.getElementById('panel-industrial').classList.toggle('active', m === 'industrial');
+  document.getElementById('panel-custom').classList.toggle('active', m === 'custom');
+
+  if (m === 'live') startLiveSensors();
+  else clearInterval(liveInterval);
 }
 
-if(/Mobi|Android/i.test(navigator.userAgent))document.getElementById('phone-prompt').style.display='block';
+// ── SENSORS ───────────────────────────────────────────────────
+async function getBattery() {
+  try {
+    if (navigator.getBattery) {
+      const b = await navigator.getBattery();
+      return Math.round(b.level * 100);
+    }
+  } catch(e) {}
+  return 85;
+}
 
-if(navigator.getBattery)navigator.getBattery().then(b=>{
-  batteryLevel=Math.round(b.level*100);
-  b.addEventListener('levelchange',()=>{batteryLevel=Math.round(b.level*100);});
-}).catch(()=>{});
+function enableMotion() {
+  if (typeof DeviceMotionEvent !== 'undefined' && DeviceMotionEvent.requestPermission) {
+    DeviceMotionEvent.requestPermission().then(s => {
+      if (s === 'granted') listenMotion();
+    }).catch(() => {});
+  } else {
+    listenMotion();
+  }
+}
 
-function colorFor(v,lo,hi){return v>=hi?'#ff2d55':v>=lo?'#ffe600':'#00ff9d'}
+function listenMotion() {
+  motionEnabled = true;
+  window.addEventListener('devicemotion', e => {
+    const a = e.acceleration || e.accelerationIncludingGravity;
+    if (a) lastVib = Math.round(((Math.abs(a.x||0) + Math.abs(a.y||0) + Math.abs(a.z||0)) / 30) * 1000) / 1000;
+  });
+}
 
-function render(d){
-  if(!d||d.error)return;
-  const colors={NOMINAL:'#00ff9d',WARNING:'#ffe600',CRITICAL:'#ff2d55'};
-  const icons={NOMINAL:'✅',WARNING:'⚠️',CRITICAL:'🚨'};
-  const descs={NOMINAL:'All systems operating within normal parameters',WARNING:'Elevated risk — schedule maintenance soon',CRITICAL:'Multiple failure indicators — immediate action required'};
-  const col=colors[d.risk]||'#00ff9d';
+function startLiveSensors() {
+  enableMotion();
+  clearInterval(liveInterval);
+  doLiveScan();
+  liveInterval = setInterval(doLiveScan, 4000);
+}
 
-  // Banner
-  document.getElementById('risk-banner').className='risk-banner '+(d.risk||'NOMINAL');
-  document.getElementById('risk-icon').textContent=icons[d.risk]||'✅';
-  document.getElementById('risk-title').textContent=d.risk||'--';
-  document.getElementById('risk-title').style.color=col;
-  document.getElementById('risk-desc').textContent=descs[d.risk]||'';
-  document.getElementById('big-score').textContent=d.score;
-  document.getElementById('big-score').style.color=col;
+async function doLiveScan() {
+  const bat  = await getBattery();
+  const plat = navigator.platform || navigator.userAgentData?.platform || navigator.userAgent.includes('Android') ? 'Android' : 'Desktop';
 
-  // Big gauge
-  document.getElementById('big-arc').style.strokeDashoffset=251.2*(1-d.health/100);
-  document.getElementById('health-num').textContent=d.health+'%';
-  document.getElementById('health-num').style.color=col;
-  document.getElementById('health-lbl').textContent=d.risk+' — '+(d.fault||'').replace(/_/g,' ');
+  document.getElementById('lv-bat').textContent  = bat + '%';
+  document.getElementById('lv-vib').textContent  = lastVib.toFixed(3) + ' m/s²';
+  document.getElementById('lv-plat').textContent = plat;
+
+  await sendToServer({
+    device_type: plat,
+    battery:     bat,
+    vibration:   lastVib,
+    cpu_load:    Math.round(Math.random() * 30 + 10),
+    memory:      Math.round(Math.random() * 30 + 30),
+    temperature: Math.round(35 + (100 - bat) * 0.3),
+    disk_usage:  50,
+  });
+}
+
+async function sendIndustrial() {
+  await sendToServer({
+    device_type:  'Industrial',
+    vibration:    parseFloat(document.getElementById('i-vib').value)  || 0.15,
+    temperature:  parseFloat(document.getElementById('i-temp').value) || 45,
+    battery:      parseFloat(document.getElementById('i-bat').value)  || 85,
+    cpu_load:     parseFloat(document.getElementById('i-cpu').value)  || 30,
+    memory:       parseFloat(document.getElementById('i-ram').value)  || 50,
+    disk_usage:   parseFloat(document.getElementById('i-disk').value) || 40,
+  });
+}
+
+async function sendCustom() {
+  await sendToServer({
+    device_type:  'Custom',
+    vibration:    parseFloat(document.getElementById('c-vib').value)  || 0.5,
+    temperature:  parseFloat(document.getElementById('c-temp').value) || 70,
+    battery:      parseFloat(document.getElementById('c-bat').value)  || 20,
+    cpu_load:     parseFloat(document.getElementById('c-cpu').value)  || 90,
+    memory:       parseFloat(document.getElementById('c-ram').value)  || 88,
+    disk_usage:   parseFloat(document.getElementById('c-disk').value) || 95,
+  });
+}
+
+async function sendToServer(payload) {
+  try {
+    const r = await fetch('/predict', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    updateDashboard(payload.device_type, d);
+    refreshData();
+  } catch(e) {
+    document.getElementById('conn-label').textContent = 'ERROR';
+  }
+}
+
+// ── RENDER ────────────────────────────────────────────────────
+function updateDashboard(devKey, d) {
+  // Arc gauge
+  const pct   = Math.min(100, d.anomaly_score || 0);
+  const total = 251.2;
+  const fill  = total - (pct / 100) * total;
+  const arc   = document.getElementById('arc-fill');
+  arc.style.strokeDashoffset = fill;
+  arc.style.stroke = pct >= 70 ? '#d63c2a' : pct >= 40 ? '#c47a10' : '#4a8c5c';
+
+  // Number
+  document.getElementById('risk-num').textContent = Math.round(pct);
+
+  // Badge + state class
+  const state = pct >= 70 ? 'critical' : pct >= 40 ? 'warning' : 'nominal';
+  const badge = pct >= 70 ? 'CRITICAL' : pct >= 40 ? 'WARNING' : 'NOMINAL';
+  const rs    = document.getElementById('risk-state');
+  rs.className = state;
+  document.getElementById('risk-badge').textContent = badge;
+
+  // Mini gauges
+  setGauge('bat',  d.battery,    '%');
+  setGauge('cpu',  d.cpu_load,   '%');
+  setGauge('ram',  d.memory,     '%');
+  setVibGauge(d.vibration);
 
   // Fault
-  const fBg={NORMAL:'rgba(0,255,157,.06)',BEARING_FAULT:'rgba(255,107,0,.1)',MISALIGNMENT:'rgba(255,230,0,.08)',IMBALANCE:'rgba(255,45,85,.1)',OVERHEATING:'rgba(255,45,85,.15)',WEAR:'rgba(255,230,0,.1)'};
-  const fBd={NORMAL:'rgba(0,255,157,.3)',BEARING_FAULT:'rgba(255,107,0,.5)',MISALIGNMENT:'rgba(255,230,0,.4)',IMBALANCE:'rgba(255,45,85,.5)',OVERHEATING:'rgba(255,45,85,.7)',WEAR:'rgba(255,230,0,.5)'};
-  const fTx={NORMAL:'#00ff9d',BEARING_FAULT:'#ff6b00',MISALIGNMENT:'#ffe600',IMBALANCE:'#ff2d55',OVERHEATING:'#ff2d55',WEAR:'#ffe600'};
-  const fb=document.getElementById('fault-box');
-  fb.style.background=fBg[d.fault]||fBg.NORMAL;
-  fb.style.borderColor=fBd[d.fault]||fBd.NORMAL;
-  document.getElementById('fault-name').textContent=(d.fault||'NORMAL').replace(/_/g,' ');
-  document.getElementById('fault-name').style.color=fTx[d.fault]||'#00ff9d';
-  document.getElementById('fault-conf').textContent=`Confidence: ${d.fault_confidence}% | Model: Random Forest`;
+  document.getElementById('fault-name').textContent = (d.fault || 'NORMAL').replace(/_/g,' ');
+  document.getElementById('fault-conf').textContent = (d.fault_confidence || 0).toFixed(1) + '%';
+}
 
-  // Stats
-  const ze=document.getElementById('z-score');
-  ze.textContent=d.z_score;ze.style.color=d.z_score>3?'#ff2d55':d.z_score>2?'#ffe600':'#00e5ff';
-  document.getElementById('freq-val').textContent=d.frequency+' Hz';
-  const te=document.getElementById('trend-val');
-  te.textContent=d.trend;te.style.color=d.trend==='RISING'?'#ff2d55':d.trend==='FALLING'?'#ffe600':'#00ff9d';
-  document.getElementById('rul-val').textContent=d.rul_hours!=null?d.rul_hours+'h':'N/A';
-  document.getElementById('vib-val').textContent=d.vibration;
-  document.getElementById('dev-val').textContent=d.device||'--';
+function setGauge(id, val, unit) {
+  document.getElementById('g-' + id).textContent = Math.round(val) + unit;
+  document.getElementById('b-' + id).style.width  = Math.min(100, val) + '%';
+  const fill = document.getElementById('b-' + id);
+  fill.style.background = val > 90 ? '#d63c2a' : val > 70 ? '#c47a10' : '#4a8c5c';
+  if (id === 'bat') fill.style.background = val < 20 ? '#d63c2a' : val < 40 ? '#c47a10' : '#4a8c5c';
+}
 
-  // Battery
-  const bc=colorFor(100-d.battery,60,80);
-  document.getElementById('bat-pct').textContent=d.battery>=0?d.battery+'%':'N/A';
-  document.getElementById('bat-pct').style.color=d.battery<20?'#ff2d55':d.battery<40?'#ffe600':'#00ff9d';
-  document.getElementById('bat-life').textContent='Est. Life: '+d.battery_life;
-  document.getElementById('bat-bar').style.width=Math.max(0,d.battery)+'%';
-  document.getElementById('bat-bar').style.background=d.battery<20?'#ff2d55':d.battery<40?'#ffe600':'#00ff9d';
+function setVibGauge(v) {
+  document.getElementById('g-vib').textContent = (v || 0).toFixed(3);
+  const pct = Math.min(100, (v / 2) * 100);
+  document.getElementById('b-vib').style.width      = pct + '%';
+  document.getElementById('b-vib').style.background = v > 0.8 ? '#d63c2a' : v > 0.5 ? '#c47a10' : '#4a8c5c';
+}
 
-  // Recs
-  document.getElementById('recs-list').innerHTML=(d.recommendations||[]).map(r=>`<div class="rec-item">${r}</div>`).join('')||'<div style="color:var(--text3);font-size:13px">No issues detected</div>';
+async function refreshData() {
+  try {
+    const r = await fetch('/data');
+    const d = await r.json();
+    const devs = d.all_devices || {};
+    const names = Object.keys(devs);
 
-  // Gauge grid
-  const gauges=[
-    {label:'CPU',val:d.cpu,unit:'%',pct:d.cpu,col:colorFor(d.cpu,70,90)},
-    {label:'MEMORY',val:d.memory,unit:'%',pct:d.memory,col:colorFor(d.memory,70,85)},
-    {label:'TEMP',val:d.temp,unit:'°C',pct:Math.min(d.temp,100),col:colorFor(d.temp,55,70)},
-    {label:'DISK',val:d.disk,unit:'%',pct:d.disk,col:colorFor(d.disk,80,92)},
-  ];
-  document.getElementById('gauge-grid').innerHTML=gauges.map((g,i)=>`
-    <div class="gauge-wrap">
-      <svg class="gauge-svg" viewBox="0 0 110 65" style="overflow:visible">
-        <path d="M10,60 A45,45 0 0,1 100,60" fill="none" stroke="#0d1825" stroke-width="10" stroke-linecap="round"/>
-        <path d="M10,60 A45,45 0 0,1 100,60" fill="none" stroke="${g.col}" stroke-width="10" stroke-linecap="round"
-          stroke-dasharray="141.4" stroke-dashoffset="${141.4*(1-g.pct/100)}" style="transition:stroke-dashoffset .6s"/>
-      </svg>
-      <div class="gauge-val" style="color:${g.col}">${g.val.toFixed(1)}${g.unit}</div>
-      <div class="gauge-label">${g.label}</div>
-    </div>`).join('');
+    document.getElementById('dev-count').textContent = names.length;
+    document.getElementById('conn-label').textContent = 'ONLINE';
 
-  // Metrics
-  const metrics=[
-    {icon:'⚙️',name:'CPU Load',val:d.cpu+'%',bar:d.cpu,col:colorFor(d.cpu,70,90)},
-    {icon:'💾',name:'Memory',val:d.memory+'%',bar:d.memory,col:colorFor(d.memory,70,85)},
-    {icon:'🌡️',name:'Temperature',val:d.temp+'°C',bar:Math.min(d.temp,100),col:colorFor(d.temp,55,70)},
-    {icon:'💿',name:'Disk',val:d.disk+'%',bar:d.disk,col:colorFor(d.disk,80,92)},
-  ];
-  document.getElementById('metrics-list').innerHTML=metrics.map(m=>`
-    <div class="metric-row">
-      <div class="metric-icon" style="background:${m.col}22">${m.icon}</div>
-      <div class="metric-info">
-        <div class="metric-name">${m.name}</div>
-        <div class="metric-val" style="color:${m.col}">${m.val}</div>
-        <div class="metric-bar"><div class="metric-bar-fill" style="width:${m.bar}%;background:${m.col}"></div></div>
+    // Device tabs
+    const tabs = names.map(n =>
+      `<button class="dev-tab ${n===selectedDev?'active':''}" onclick="selectDev('${n}')">${n.toUpperCase()}</button>`
+    ).join('');
+    document.getElementById('dev-tabs').innerHTML = tabs;
+
+    if (!selectedDev && names.length) selectedDev = names[names.length-1];
+    const current = devs[selectedDev] || {};
+
+    if (!names.length) { document.getElementById('empty').style.display = 'flex'; return; }
+    document.getElementById('empty').style.display = 'none';
+
+    renderRightPanel(current, d.history || []);
+  } catch(e) {}
+}
+
+function selectDev(name) {
+  selectedDev = name;
+  refreshData();
+}
+
+function renderRightPanel(d, hist) {
+  const recs = (d.recommendations || []).map((r, i) =>
+    `<li><span class="rec-num">${String(i+1).padStart(2,'0')}.</span>${r}</li>`
+  ).join('');
+
+  const sparkBars = hist.map(v => {
+    const h   = Math.max(4, v);
+    const col = v >= 70 ? '#d63c2a' : v >= 40 ? '#c47a10' : '#4a8c5c';
+    return `<div class="spark-col" style="height:${h}%;background:${col}"></div>`;
+  }).join('');
+
+  // CPU mini chart (simulated from history)
+  const cpuBars = hist.map((v, i) => {
+    const c = Math.max(4, Math.min(100, 10 + v * 0.5 + (i % 3) * 5));
+    return `<div class="spark-col" style="height:${c}%;background:#e8a020"></div>`;
+  }).join('');
+
+  // Battery trend
+  const batBars = hist.map((v, i) => {
+    const b = Math.max(4, Math.min(100, (d.battery || 80) - i * 0.5));
+    const col = b < 20 ? '#d63c2a' : b < 40 ? '#c47a10' : '#4a8c5c';
+    return `<div class="spark-col" style="height:${b}%;background:${col}"></div>`;
+  }).join('');
+
+  const mc = document.getElementById('main-content');
+  mc.innerHTML = `
+    <div class="rec-strip">
+      <div class="rec-title">ML RECOMMENDATIONS — ${(d.status || 'NO STATUS')}</div>
+      <ul class="rec-list">${recs}</ul>
+    </div>
+    <div class="charts-row">
+      <div class="chart-block">
+        <div class="chart-title">Anomaly Score History</div>
+        <div class="spark-area">${sparkBars || '<span style="color:var(--muted);font-size:10px">NO HISTORY</span>'}</div>
       </div>
-    </div>`).join('');
-
-  // Charts
-  if(d.history){
-    const h=d.history, labels=h.score.map((_,i)=>i);
-    function pushChart(c,datasets){c.data.labels=labels;datasets.forEach((data,i)=>{c.data.datasets[i].data=data;});c.update('none');}
-    pushChart(charts.score,[h.score]);
-    pushChart(charts.vib,[h.vibration.map(v=>Math.min(v*100,100))]);
-    pushChart(charts.cpu,[h.cpu,h.memory]);
-  }
+      <div class="chart-block">
+        <div class="chart-title">CPU Load Correlation</div>
+        <div class="spark-area">${cpuBars || '<span style="color:var(--muted);font-size:10px">NO HISTORY</span>'}</div>
+      </div>
+      <div class="chart-block">
+        <div class="chart-title">Battery Life Projection</div>
+        <div class="spark-area">${batBars || '<span style="color:var(--muted);font-size:10px">NO HISTORY</span>'}</div>
+      </div>
+    </div>
+    <div class="meta-row">
+      <div class="meta-cell"><div class="meta-k">Z-SCORE</div><div class="meta-v">${d.z_score ?? '--'}</div></div>
+      <div class="meta-cell"><div class="meta-k">TREND</div><div class="meta-v">${d.trend ?? '--'}</div></div>
+      <div class="meta-cell"><div class="meta-k">RUL ESTIMATE</div><div class="meta-v">${d.rul_hours === 999 ? '∞' : (d.rul_hours ?? '--')}h</div></div>
+      <div class="meta-cell"><div class="meta-k">TEMPERATURE</div><div class="meta-v">${d.temperature ?? '--'}°C</div></div>
+      <div class="meta-cell"><div class="meta-k">DISK USAGE</div><div class="meta-v">${d.disk_usage ?? '--'}%</div></div>
+    </div>`;
 }
 
-function initCharts(){
-  const base={responsive:true,maintainAspectRatio:false,animation:{duration:300},plugins:{legend:{display:false}},scales:{x:{display:false},y:{display:true,min:0,max:100,grid:{color:'#0d1825'},ticks:{color:'#2a3f55',font:{size:9},maxTicksLimit:4}}}};
-  charts.score=new Chart(document.getElementById('c-score'),{type:'line',data:{labels:[],datasets:[{data:[],borderColor:'#ff2d55',borderWidth:2,pointRadius:0,fill:true,backgroundColor:'#ff2d5518',tension:.4}]},options:base});
-  charts.vib=new Chart(document.getElementById('c-vib'),{type:'line',data:{labels:[],datasets:[{data:[],borderColor:'#00e5ff',borderWidth:2,pointRadius:0,fill:true,backgroundColor:'#00e5ff18',tension:.4}]},options:{...base,scales:{...base.scales,y:{...base.scales.y,max:undefined,min:undefined}}}});
-  charts.cpu=new Chart(document.getElementById('c-cpu'),{type:'line',data:{labels:[],datasets:[{label:'CPU',data:[],borderColor:'#00e5ff',borderWidth:2,pointRadius:0,fill:false,tension:.4},{label:'Memory',data:[],borderColor:'#a78bfa',borderWidth:2,pointRadius:0,fill:false,tension:.4}]},options:{...base,plugins:{legend:{display:true,labels:{color:'#5a7a99',font:{size:10},boxWidth:10}}}}});
-}
-
-async function poll(){
-  try{const r=await fetch('/data');const d=await r.json();if(d&&!d.error)render(d);}catch(e){}
-}
-setInterval(poll,2000);
-
-let autoInterval=setInterval(async()=>{
-  if(mode!=='live')return;
-  const mem=performance.memory?Math.round(performance.memory.usedJSHeapSize/performance.memory.jsHeapSizeLimit*100):50;
-  const r=await fetch('/predict',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({vibration:0.05,cpu:50,memory:mem,battery:batteryLevel>=0?batteryLevel:80,temp:38,disk:50,device:navigator.platform||'Desktop'})
-  }).catch(()=>{});
-  if(r){const d=await r.json();render(d);}
-},4000);
-
-function startPhoneSensors(){
-  function activate(){
-    phoneActive=true;document.getElementById('phone-prompt').style.display='none';
-    let st=null;
-    window.addEventListener('devicemotion',e=>{
-      const a=e.accelerationIncludingGravity;if(!a)return;
-      const vib=Math.max(0,Math.sqrt(a.x*a.x+a.y*a.y+a.z*a.z)-9.81);
-      clearTimeout(st);st=setTimeout(()=>{
-        fetch('/predict',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({vibration:parseFloat(vib.toFixed(4)),battery:batteryLevel,cpu:50,memory:60,temp:35,disk:50,device:'Phone'})
-        }).then(r=>r.json()).then(render).catch(()=>{});
-      },300);
-    });
-  }
-  if(typeof DeviceMotionEvent!=='undefined'&&typeof DeviceMotionEvent.requestPermission==='function'){
-    DeviceMotionEvent.requestPermission().then(p=>{if(p==='granted')activate();}).catch(()=>{});
-  }else{activate();}
-}
-
-async function submitIndustrial(){
-  const d={vibration:+document.getElementById('ind-vib').value,cpu:+document.getElementById('ind-cpu').value,memory:+document.getElementById('ind-mem').value,battery:+document.getElementById('ind-bat').value,temp:+document.getElementById('ind-temp').value,disk:+document.getElementById('ind-disk').value,device:'Industrial'};
-  const r=await fetch('/predict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
-  render(await r.json());setMode('live');
-}
-
-async function submitCustom(){
-  const d={vibration:+document.getElementById('cv-in').value,cpu:+document.getElementById('cc-in').value,memory:+document.getElementById('cm-in').value,battery:+document.getElementById('cb-in').value,temp:+document.getElementById('ct-in').value,disk:+document.getElementById('cd-in').value,device:'Custom'};
-  const r=await fetch('/predict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
-  render(await r.json());setMode('live');
-}
-
-initCharts();
+// ── BOOT ──────────────────────────────────────────────────────
+startLiveSensors();
+setInterval(refreshData, 4000);
+refreshData();
 </script>
 </body>
 </html>"""
 
+
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.environ.get("PORT", 8000))
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)
