@@ -6,34 +6,22 @@ from sklearn.ensemble import IsolationForest
 
 app = FastAPI()
 
-# ══════════════════════════════════════════════════════════════
-#  SINGLE ML MODEL: Isolation Forest
-#  Feature vector: [vibration, cpu, ram, battery, temp, disk]
-#
-#  Trained ONLY on healthy data so the model learns the boundary
-#  of "normal". Anything outside that boundary scores higher.
-#
-#  Calibration:
-#    good_thresh = p95 of normal training scores  → maps to 0
-#    bad_thresh  = p5  of synthetic fault scores  → maps to 100
-# ══════════════════════════════════════════════════════════════
-
 rng = np.random.default_rng(42)
 N   = 1200
 
 X_healthy = np.column_stack([
-    rng.uniform(0.00, 0.40, N),   # vibration m/s²
-    rng.uniform(5,    80,   N),   # cpu %
-    rng.uniform(10,   80,   N),   # ram %
-    rng.uniform(25,   100,  N),   # battery %
-    rng.uniform(25,   68,   N),   # temperature °C
-    rng.uniform(5,    80,   N),   # disk %
+    rng.uniform(0.00, 0.40, N),   # vibration 
+    rng.uniform(5,    80,   N),   # cpu 
+    rng.uniform(10,   80,   N),   # ram 
+    rng.uniform(25,   100,  N),   # battery
+    rng.uniform(25,   68,   N),   # temperature 
+    rng.uniform(5,    80,   N),   # disk
 ])
 
 iforest = IsolationForest(contamination=0.02, n_estimators=200, random_state=42)
 iforest.fit(X_healthy)
 
-# calibrate thresholds against training data + synthetic faults
+
 _s_h = iforest.score_samples(X_healthy)
 GOOD_THRESH = float(np.percentile(_s_h, 95))
 
@@ -99,17 +87,17 @@ async def predict(data: dict):
     disk = float(data.get("disk_usage",  50))
     dev  = str(data.get("device_type",   "Unknown"))
 
-    # 1. IF component (0–100)
+    
     if_comp = if_score([vib, cpu, ram, bat, temp, disk])
 
-    # 2. Rule penalty (0–60 raw, scaled to 0–100)
+    
     penalty = rule_penalty(vib, cpu, ram, bat, temp, disk)
 
-    # 3. Weighted combination: IF 60%, rules 40%
+    
     raw = if_comp * 0.60 + (penalty / 60 * 100) * 0.40
     health_score = int(np.clip(raw, 0, 100))
 
-    # 4. Sanity cap: if every metric is clearly fine, can't be CRITICAL
+    
     all_fine = (vib < 0.45 and cpu < 85 and ram < 85
                 and bat > 22 and temp < 72 and disk < 88)
     if all_fine:
@@ -117,7 +105,7 @@ async def predict(data: dict):
 
     fault = classify_fault(vib, cpu, ram, bat, temp, disk, health_score)
 
-    # Battery drain rate from history
+    
     dev_hist = device_history.get(dev, [])
     if len(dev_hist) >= 3:
         bats = [h["bat"] for h in dev_hist[-6:]]
@@ -129,7 +117,7 @@ async def predict(data: dict):
     else:
         rul_h, bat_trend = 999, "STABLE"
 
-    # Human-readable labels
+    
     vib_health = ("SMOOTH" if vib < 0.15 else "NORMAL" if vib < 0.40 else
                   "ELEVATED" if vib < 0.70 else "HIGH" if vib < 1.20 else "CRITICAL")
     thermal    = ("COOL" if temp < 40 else "NORMAL" if temp < 60 else
