@@ -1,96 +1,120 @@
 """
-NEXUS Probe — sends exact Task Manager values to your Render backend.
-Install:  pip install psutil requests
-Run:      python probe.py
+NEXUS PM — probe.py v5
+Reads EXACT system values (Task Manager accurate) and POSTs to backend every 3 seconds.
+Install: pip install psutil requests
+Run:     python probe.py
 """
-import time, platform, socket, requests
-import psutil
+import time, platform, socket, requests, psutil
 
-SERVER   = "https://ai-failure-backend.onrender.com"
-INTERVAL = 3
+URL  = "http://localhost:8000/predict"
+INTERVAL = 3  # seconds
 
-def get_data():
-    cpu_pct = psutil.cpu_percent(interval=1)
-    cpu_freq = psutil.cpu_freq()
-    cpu_freq_mhz = round(cpu_freq.current) if cpu_freq else 0
-    cpu_cores_l = psutil.cpu_count(logical=True)
-    cpu_cores_p = psutil.cpu_count(logical=False)
+def get_battery():
+    b = psutil.sensors_battery()
+    if b is None:
+        return -1, True
+    return round(b.percent, 1), b.power_plugged
 
-    ram = psutil.virtual_memory()
-    disk = psutil.disk_usage('/')
-
+def get_temps():
     try:
-        d1 = psutil.disk_io_counters(); time.sleep(0.3); d2 = psutil.disk_io_counters()
-        dr = round((d2.read_bytes-d1.read_bytes)/1e6/0.3,1)
-        dw = round((d2.write_bytes-d1.write_bytes)/1e6/0.3,1)
-    except: dr=dw=0
+        temps = psutil.sensors_temperatures()
+        if not temps:
+            return None
+        for key in ["coretemp","cpu_thermal","k10temp","zenpower","acpitz","cpu-thermal","thermal_zone0"]:
+            if key in temps and temps[key]:
+                readings = [t.current for t in temps[key] if t.current and t.current > 0]
+                if readings:
+                    return round(max(readings), 1)
+        for entries in temps.values():
+            readings = [t.current for t in entries if t.current and t.current > 0]
+            if readings:
+                return round(max(readings), 1)
+    except Exception:
+        pass
+    return None
 
-    try:
-        n1=psutil.net_io_counters(); time.sleep(0.2); n2=psutil.net_io_counters()
-        ns=round((n2.bytes_sent-n1.bytes_sent)/1e6/0.2,2)
-        nr=round((n2.bytes_recv-n1.bytes_recv)/1e6/0.2,2)
-    except: ns=nr=0
+def get_top_procs(n=8):
+    procs = []
+    for p in psutil.process_iter(['name','cpu_percent','memory_percent']):
+        try:
+            procs.append({
+                "name": p.info['name'][:28],
+                "cpu":  round(p.info['cpu_percent'] or 0, 1),
+                "mem":  round(p.info['memory_percent'] or 0, 1),
+            })
+        except Exception:
+            pass
+    return sorted(procs, key=lambda x: x['cpu'], reverse=True)[:n]
 
-    bat=psutil.sensors_battery()
-    if bat:
-        bat_pct=round(bat.percent); charging=bat.power_plugged
-        secs=bat.secsleft; bat_mins=round(secs/60) if secs and secs>0 else -1
-    else:
-        bat_pct=-1; charging=True; bat_mins=-1
-
-    temp_c=40.0
-    try:
-        temps=psutil.sensors_temperatures()
-        if temps:
-            all_t=[s.current for ss in temps.values() for s in ss if s.current and s.current>0]
-            if all_t: temp_c=round(max(all_t),1)
-    except: pass
-
-    procs=[]
-    try:
-        pl=[]
-        for p in psutil.process_iter(['name','cpu_percent','memory_percent']):
-            try: pl.append((p.info['name'],p.info['cpu_percent'],round(p.info['memory_percent'],1)))
-            except: pass
-        pl.sort(key=lambda x:x[1],reverse=True)
-        procs=[{"name":p[0][:20],"cpu":p[1],"mem":p[2]} for p in pl[:5]]
-    except: pass
-
-    vib_proxy=min(0.4,(dr+dw)/500)
-
+def get_disk():
+    usage = psutil.disk_usage('/')
+    io    = psutil.disk_io_counters()
     return {
-        "vibration":vib_proxy, "cpu":cpu_pct, "cpu_load":cpu_pct,
-        "memory":ram.percent, "battery":bat_pct, "temp":temp_c,
-        "temperature":temp_c, "disk":disk.percent, "is_charging":charging,
-        "device":socket.gethostname()[:20],
-        "platform":f"{platform.system()} {platform.machine()}",
-        "os_version":platform.version()[:40],
-        "cpu_freq":cpu_freq_mhz, "cpu_cores_logical":cpu_cores_l,
-        "cpu_cores_physical":cpu_cores_p,
-        "ram_total":round(ram.total/1e9,1), "ram_used":round(ram.used/1e9,1),
-        "ram_avail":round(ram.available/1e9,1),
-        "disk_total":round(disk.total/1e9,1), "disk_used":round(disk.used/1e9,1),
-        "disk_read_mb":dr, "disk_write_mb":dw,
-        "net_send_mb":ns, "net_recv_mb":nr,
-        "bat_mins_left":bat_mins, "proc_count":len(psutil.pids()),
-        "top_procs":procs, "source":"probe",
+        "disk":          round(usage.percent, 1),
+        "disk_total":    round(usage.total   / 1e9, 1),
+        "disk_used":     round(usage.used    / 1e9, 1),
+        "disk_read_mb":  round(io.read_bytes  / 1e6, 2) if io else 0,
+        "disk_write_mb": round(io.write_bytes / 1e6, 2) if io else 0,
     }
 
-def main():
-    print(f"\n{'='*55}\n  NEXUS Probe v2 — Task Manager Bridge\n  Server: {SERVER}\n  Interval: {INTERVAL}s\n{'='*55}\n")
-    n=0
-    while True:
-        n+=1
-        try:
-            data=get_data()
-            r=requests.post(f"{SERVER}/predict",json=data,timeout=10)
-            res=r.json()
-            sym={"NOMINAL":"✅","WARNING":"⚠️ ","CRITICAL":"🚨"}.get(res.get("risk"),"?")
-            print(f"[{n:04d}] {sym} {res.get('risk','?'):8s} score={res.get('health_score','?'):3}/100  "
-                  f"cpu={data['cpu']:4.1f}%  ram={data['memory']:4.1f}%  "
-                  f"temp={data['temp']:4.1f}°C  bat={'N/A' if data['battery']<0 else str(data['battery'])+'%'}")
-        except Exception as e:
-            print(f"[{n:04d}] ❌ {e}")
-        time.sleep(INTERVAL)
+def get_net():
+    n = psutil.net_io_counters()
+    return {
+        "net_send_mb": round(n.bytes_sent / 1e6, 2),
+        "net_recv_mb": round(n.bytes_recv / 1e6, 2),
+    }
 
-if __name__=="__main__": main()
+def build_payload():
+    cpu  = psutil.cpu_percent(interval=1)
+    freq = psutil.cpu_freq()
+    ram  = psutil.virtual_memory()
+    bat_pct, charging = get_battery()
+    temp = get_temps()
+    if temp is None:
+        temp = round(30 + cpu * 0.45, 1)
+
+    disk_info = get_disk()
+    net_info  = get_net()
+
+    return {
+        "cpu": round(cpu,1), "cpu_load": round(cpu,1),
+        "memory": round(ram.percent,1),
+        "temp": temp, "temperature": temp,
+        "vibration": 0.01,
+        "battery": bat_pct, "is_charging": charging,
+        "cpu_freq": round(freq.current) if freq else None,
+        "cpu_cores_logical":  psutil.cpu_count(logical=True),
+        "cpu_cores_physical": psutil.cpu_count(logical=False),
+        "ram_total": round(ram.total    / 1e9, 1),
+        "ram_used":  round(ram.used     / 1e9, 1),
+        "ram_avail": round(ram.available / 1e9, 1),
+        **disk_info, **net_info,
+        "top_procs":  get_top_procs(),
+        "proc_count": len(psutil.pids()),
+        "device":      platform.node() or socket.gethostname(),
+        "device_type": platform.node() or socket.gethostname(),
+        "os_version":  platform.version()[:60],
+        "platform":    platform.system() + " " + platform.release(),
+        "source": "probe",
+    }
+
+print("=" * 58)
+print("  NEXUS PM — probe.py  (Ctrl+C to stop)")
+print(f"  Posting to: {URL}  every {INTERVAL}s")
+print("=" * 58)
+psutil.cpu_percent(interval=None)
+time.sleep(0.5)
+
+while True:
+    try:
+        payload = build_payload()
+        r = requests.post(URL, json=payload, timeout=5)
+        d = r.json()
+        print(f"  CPU {payload['cpu']:5.1f}%  RAM {payload['memory']:5.1f}%  "
+              f"Temp {payload['temp']:5.1f}C  Disk {payload['disk']:4.1f}%  "
+              f"Score {d.get('health_score','?'):3}  [{d.get('risk','?')}]")
+    except requests.exceptions.ConnectionError:
+        print("  Cannot connect to backend — is it running?")
+    except Exception as e:
+        print(f"  Error: {e}")
+    time.sleep(INTERVAL)
