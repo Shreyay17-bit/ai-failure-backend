@@ -6,7 +6,7 @@ Run:     python probe.py
 """
 import time, platform, socket, requests, psutil
 
-URL  = "http://localhost:8000/predict"
+URL  = "https://ai-failure-backend.onrender.com/monitor"
 INTERVAL = 3  # seconds
 
 def get_battery():
